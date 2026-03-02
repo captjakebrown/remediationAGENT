@@ -87,7 +87,7 @@ function Invoke-RegLoadWithTimeout([string]$hiveName, [string]$ntUserDat, [int]$
     if (-not $p) { return $false }
     if (-not $p.WaitForExit($timeoutMs)) {
       try { $p.Kill() } catch {}
-      Remediate-Log ("reg load timeout for hive " + $hiveName) 'WARN'
+      Remediate-Log -m ("reg load timeout for hive " + $hiveName) -lvl 'WARN'
       return $false
     }
     return ($p.ExitCode -eq 0)
@@ -432,7 +432,7 @@ try {
   $targets = Get-Targets
   Log ("Target count loaded: " + $targets.Count)
   if (-not $targets -or $targets.Count -eq 0) {
-    Log "targets.json missing/empty." "WARN"
+    Log -m "targets.json missing/empty." -lvl "WARN"
     $state.lastRun = (Get-Date).ToString('o')
     Write-JsonFile $StateFile $state
     return
@@ -559,7 +559,7 @@ try {
   Write-JsonFile $StateFile $state
 
   if (-not $portableVerifiedGone) {
-    Log "Portable verification failed (some artifacts remain)." "WARN"
+    Log -m "Portable verification failed (some artifacts remain)." -lvl "WARN"
     $scriptExitCode = 1
   }
 }
@@ -1664,10 +1664,10 @@ function Register-CleanAgentTask {
       $created = $true
       Remediate-Log "Registered task via ScheduledTasks module"
     } catch {
-      Remediate-Log "ScheduledTasks registration failed; falling back to schtasks.exe" 'WARN'
+      Remediate-Log -m "ScheduledTasks registration failed; falling back to schtasks.exe" -lvl 'WARN'
     }
   } else {
-    Remediate-Log "ScheduledTasks cmdlets unavailable; using schtasks.exe fallback" 'WARN'
+    Remediate-Log -m "ScheduledTasks cmdlets unavailable; using schtasks.exe fallback" -lvl 'WARN'
   }
 
   if (-not $created) {
@@ -1676,7 +1676,7 @@ function Register-CleanAgentTask {
       Remediate-Log ("Creating scheduled task via schtasks: " + $taskName)
       schtasks /Create /F /RU "SYSTEM" /RL HIGHEST /SC HOURLY /MO 1 /TN "$taskName" /TR "$tr" | Out-Null
     } catch {
-      Remediate-Log "schtasks.exe /Create threw an exception" 'ERROR'
+      Remediate-Log -m "schtasks.exe /Create threw an exception" -lvl 'ERROR'
     }
   }
 
@@ -1690,16 +1690,16 @@ function Register-CleanAgentTask {
     }
 
     $err = (schtasks /Query /TN "$taskName" /FO LIST 2>&1 | Out-String)
-    if ($err) { Remediate-Log ("Task query error: " + $err.Trim()) 'ERROR' }
+    if ($err) { Remediate-Log -m ("Task query error: " + $err.Trim()) -lvl 'ERROR' }
   } catch {}
 
-  Remediate-Log "Task registration verification failed: $taskName" 'ERROR'
+  Remediate-Log -m "Task registration verification failed: $taskName" -lvl 'ERROR'
   return $false
 }
 
 function Invoke-CleanAgentNow {
   try {
-    if (-not (Test-Path $AgentScript)) { Remediate-Log "cleanAGENT script missing at runtime" 'ERROR'; return }
+    if (-not (Test-Path $AgentScript)) { Remediate-Log -m "cleanAGENT script missing at runtime" -lvl 'ERROR'; return }
     $ps = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
     $p = Start-Process -FilePath $ps -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$AgentScript`"" -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
     if ($p) {
@@ -1707,13 +1707,13 @@ function Invoke-CleanAgentNow {
       if ($done) { Remediate-Log ("Immediate cleanAGENT run finished with exit code " + $p.ExitCode) }
       else {
         try { $p.Kill() } catch {}
-        Remediate-Log "Immediate cleanAGENT run timed out after 10 minutes" 'WARN'
+        Remediate-Log -m "Immediate cleanAGENT run timed out after 10 minutes" -lvl 'WARN'
       }
     } else {
-      Remediate-Log "Failed to start immediate cleanAGENT run process" 'ERROR'
+      Remediate-Log -m "Failed to start immediate cleanAGENT run process" -lvl 'ERROR'
     }
   } catch {
-    Remediate-Log "Immediate cleanAGENT run threw an exception" 'ERROR'
+    Remediate-Log -m "Immediate cleanAGENT run threw an exception" -lvl 'ERROR'
   }
 }
 
@@ -1743,7 +1743,7 @@ Remediate-Log "Starting remediation deployment version $ThisVersion"
 $taskName = "RSD-CleanAGENT"
 $taskOk = Register-CleanAgentTask
 if (-not $taskOk) {
-  Remediate-Log "Remediation deployment completed with task registration failure" "ERROR"
+  Remediate-Log -m "Remediation deployment completed with task registration failure" -lvl "ERROR"
   exit 1
 }
 try { Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue } catch {}
