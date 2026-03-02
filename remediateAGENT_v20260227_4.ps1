@@ -1,7 +1,7 @@
 <#
 RSD CleanAgent - Intune Proactive Remediation Remediation
 PowerShell 5.1 compatible
-Version: 2026.02.27.4
+Version: 2026.03.02.3
 
 Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
 #>
@@ -16,12 +16,12 @@ $VersionFile = Join-Path $AgentRoot 'version.txt'
 $StateFile   = Join-Path $AgentRoot 'state.json'
 $LogDir      = Join-Path $AgentRoot 'Logs'
 
-$ThisVersion = '2026.02.27.4'
+$ThisVersion = '2026.03.02.3'
 
 $AgentPayload = @'
 <#
 RSD CleanAgent (local) - PowerShell 5.1
-Version: 2026.02.27.4
+Version: 2026.03.02.3
 
 Behavior:
 - Batch inventory UWP/ARP once per run.
@@ -64,12 +64,80 @@ function Write-JsonFile([string]$path, $obj) {
   try { ($obj | ConvertTo-Json -Depth 8) | Set-Content -Path $path -Encoding UTF8 } catch {}
 }
 
-function Disable-OneDriveDeletePrompt {
+function Get-ActiveUserSid([string]$user) {
+  if (-not $user) { return $null }
+  try {
+    $profiles = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction SilentlyContinue
+    foreach ($p in $profiles) {
+      if (-not $p.LocalPath) { continue }
+      if ($p.LocalPath -ieq ("C:\Users\{0}" -f $user)) { return $p.SID }
+    }
+  } catch {}
+  return $null
+}
+
+function Invoke-RegLoadWithTimeout([string]$hiveName, [string]$ntUserDat, [int]$timeoutMs) {
+  try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'reg.exe'
+    $psi.Arguments = "load HKU\$hiveName `"$ntUserDat`""
+    $psi.CreateNoWindow = $true
+    $psi.UseShellExecute = $false
+    $p = [System.Diagnostics.Process]::Start($psi)
+    if (-not $p) { return $false }
+    if (-not $p.WaitForExit($timeoutMs)) {
+      try { $p.Kill() } catch {}
+      Remediate-Log ("reg load timeout for hive " + $hiveName) 'WARN'
+      return $false
+    }
+    return ($p.ExitCode -eq 0)
+  } catch { return $false }
+}
+
+function Set-OneDriveDeletePromptPolicyForUser([string]$user) {
+  if (-not $user) { return }
+
+  # First preference: active loaded user hive by SID (fast, no hive mount/unmount risk).
+  $sid = Get-ActiveUserSid $user
+  if ($sid -and (Test-Path ("Registry::HKEY_USERS\{0}" -f $sid))) {
+    try {
+      $loadedPath = "Registry::HKEY_USERS\{0}\Software\Microsoft\OneDrive" -f $sid
+      if (-not (Test-Path $loadedPath)) { New-Item -Path $loadedPath -Force | Out-Null }
+      New-ItemProperty -Path $loadedPath -Name 'DisableFirstDeleteDialog' -Value 1 -PropertyType DWord -Force | Out-Null
+      Log ("Applied HKCU OneDrive policy to loaded hive SID=" + $sid)
+      return
+    } catch {}
+  }
+
+  # Fallback: mount NTUSER.DAT with timeout so we cannot block the clean pass.
+  $ntUser = "C:\Users\{0}\NTUSER.DAT" -f $user
+  if (-not (Test-Path $ntUser)) { return }
+
+  $mounted = $false
+  try {
+    if (-not (Test-Path 'Registry::HKEY_USERS\RSDTEMP')) {
+      $mounted = Invoke-RegLoadWithTimeout 'RSDTEMP' $ntUser 5000
+    }
+    if (Test-Path 'Registry::HKEY_USERS\RSDTEMP') {
+      $userPath = 'Registry::HKEY_USERS\RSDTEMP\Software\Microsoft\OneDrive'
+      if (-not (Test-Path $userPath)) { New-Item -Path $userPath -Force | Out-Null }
+      New-ItemProperty -Path $userPath -Name 'DisableFirstDeleteDialog' -Value 1 -PropertyType DWord -Force | Out-Null
+      Log ("Applied HKCU OneDrive policy using mounted temp hive for user=" + $user)
+    }
+  } catch {}
+  finally {
+    if ($mounted) { try { reg.exe unload "HKU\RSDTEMP" | Out-Null } catch {} }
+  }
+}
+
+
+function Disable-OneDriveDeletePrompt([string]$user) {
   try {
     $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive'
     if (-not (Test-Path $policyPath)) { New-Item -Path $policyPath -Force | Out-Null }
-    Set-ItemProperty -Path $policyPath -Name 'DisableFirstDeleteDialog' -Value 1 -Type DWord
+    New-ItemProperty -Path $policyPath -Name 'DisableFirstDeleteDialog' -Value 1 -PropertyType DWord -Force | Out-Null
   } catch {}
+  Set-OneDriveDeletePromptPolicyForUser $user
 }
 
 function Is-DueToRun($state) {
@@ -223,7 +291,11 @@ function Get-PresenceZonesForUser([string]$user) {
 }
 
 function Get-ShallowCDrives() {
-  $skip = @('windows','program files','program files (x86)','programdata','users','perflogs','recovery','system volume information','$recycle.bin','msocache')
+  $skip = @(
+    'windows','program files','program files (x86)','programdata','users','recovery',
+    'classpolicy','documents and settings','hp','inetpub','onedrivetemp','swsetup','system.sav',
+    'perflogs','system volume information','$recycle.bin','msocache'
+  )
   $out = @()
   try {
     Get-ChildItem -Path 'C:\' -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
@@ -303,115 +375,172 @@ function Remove-Paths([string[]]$paths) {
   }
 }
 
-# MAIN
-Disable-OneDriveDeletePrompt
+function Remove-QuickLaunchMatches([string]$user, [string[]]$stems) {
+  if (-not $user -or -not $stems -or $stems.Count -eq 0) { return $false }
+  $root = "C:\Users\{0}\AppData\Roaming\Microsoft\Internet Explorer\Quick Launch" -f $user
+  if (-not (Test-Path $root)) { return $false }
 
-$state = Read-JsonFile $StateFile @{ phase=0; phaseStart=(Get-Date).ToString('o'); lastDetect=(Get-Date).ToString('o'); lastRun=(Get-Date).ToString('o'); lastFound=@() }
-$state = Advance-PhaseIfTime $state
-
-if (-not (Is-DueToRun $state)) {
-  $state.lastRun = (Get-Date).ToString('o')
-  Write-JsonFile $StateFile $state
-  exit 0
-}
-
-$activeUser = Get-ActiveUser
-Log ("Active user: " + $activeUser)
-
-$targets = Get-Targets
-if (-not $targets -or $targets.Count -eq 0) {
-  Log "targets.json missing/empty." "WARN"
-  $state.lastRun = (Get-Date).ToString('o')
-  Write-JsonFile $StateFile $state
-  exit 0
-}
-
-$uwpSet = Snapshot-Uwp
-$arpList = Snapshot-Arp
-
-$foundThisRun = @()
-$removedThisRun = @()
-
-# Pass 1: remove UWP + quiet ARP
-foreach ($t in $targets) {
-  $present = $false
-  if ($t.UWPFamily -and $uwpSet.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $present = $true; $foundThisRun += $t.Name }
-  if (-not $present -and $t.ARPName) {
-    if ((Match-Arp $arpList $t.ARPName).Count -gt 0) { $present = $true; $foundThisRun += $t.Name }
-  }
-  if (-not $present) { continue }
-
-  $did = $false
-  if ($t.UWPFamily) { $did = (Remove-UwpFamily $t.UWPFamily) -or $did }
-
-  if ($t.ARPName) {
-    $matches = Match-Arp $arpList $t.ARPName
-    foreach ($e in $matches) {
-      if ($e.QuietUninstallString) {
-        Log ("Quiet uninstall ARP: " + $e.DisplayName)
-        $ok = Invoke-QuietUninstall $e.QuietUninstallString
-        if ($ok) { $did = $true } else { Log ("Quiet uninstall failed: " + $e.DisplayName) "WARN" }
-      } else {
-        Log ("No QuietUninstallString for: " + $e.DisplayName) "WARN"
+  $removed = $false
+  try {
+    Get-ChildItem -LiteralPath $root -File -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+      $n = $_.Name.ToLowerInvariant()
+      foreach ($s in $stems) {
+        $needle = $s.ToLowerInvariant()
+        if ($needle.Length -lt 4) { continue }
+        if ($n -like ('*' + $needle + '*')) {
+          try {
+            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+            $removed = $true
+            Log ("Removed Quick Launch shortcut: " + $_.FullName)
+          } catch {}
+          break
+        }
       }
+    }
+  } catch {}
+
+  return $removed
+}
+
+# MAIN
+$scriptExitCode = 0
+$mutexName = 'Global\\RSDCleanAgentMutex'
+$mutex = $null
+$mutexOwned = $false
+
+try {
+  try {
+    $mutex = New-Object System.Threading.Mutex($false, $mutexName)
+    $mutexOwned = $mutex.WaitOne(0, $false)
+    if (-not $mutexOwned) { return }
+  } catch {}
+
+  $state = Read-JsonFile $StateFile @{ phase=0; phaseStart=(Get-Date).ToString('o'); lastDetect=(Get-Date).ToString('o'); lastRun=(Get-Date).ToString('o'); lastFound=@() }
+  $state = Advance-PhaseIfTime $state
+
+  if (-not (Is-DueToRun $state)) {
+    $state.lastRun = (Get-Date).ToString('o')
+    Write-JsonFile $StateFile $state
+    return
+  }
+
+  $activeUser = Get-ActiveUser
+  Log ("Active user: " + $activeUser)
+  Disable-OneDriveDeletePrompt $activeUser
+  Log "OneDrive delete prompt policy stage complete"
+
+  $targets = Get-Targets
+  Log ("Target count loaded: " + $targets.Count)
+  if (-not $targets -or $targets.Count -eq 0) {
+    Log "targets.json missing/empty." "WARN"
+    $state.lastRun = (Get-Date).ToString('o')
+    Write-JsonFile $StateFile $state
+    return
+  }
+
+  $uwpSet = Snapshot-Uwp
+  $arpList = Snapshot-Arp
+
+  $foundThisRun = @()
+  $removedThisRun = @()
+
+  # Pass 1: remove UWP + quiet ARP
+  foreach ($t in $targets) {
+    $present = $false
+    if ($t.UWPFamily -and $uwpSet.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $present = $true; $foundThisRun += $t.Name }
+    if (-not $present -and $t.ARPName) {
+      if ((Match-Arp $arpList $t.ARPName).Count -gt 0) { $present = $true; $foundThisRun += $t.Name }
+    }
+    if (-not $present) { continue }
+
+    $did = $false
+    if ($t.UWPFamily) { $did = (Remove-UwpFamily $t.UWPFamily) -or $did }
+
+    if ($t.ARPName) {
+      $matches = Match-Arp $arpList $t.ARPName
+      foreach ($e in $matches) {
+        if ($e.QuietUninstallString) {
+          Log ("Quiet uninstall ARP: " + $e.DisplayName)
+          $ok = Invoke-QuietUninstall $e.QuietUninstallString
+          if ($ok) { $did = $true } else { Log ("Quiet uninstall failed: " + $e.DisplayName) "WARN" }
+        } else {
+          Log ("No QuietUninstallString for: " + $e.DisplayName) "WARN"
+        }
+      }
+    }
+
+    if ($did) { $removedThisRun += $t.Name }
+  }
+
+  # Refresh & residual filesystem pass (portable/installer artifacts)
+  $uwpSet2 = Snapshot-Uwp
+  $arpList2 = Snapshot-Arp
+
+  $residual = @()
+  foreach ($t in $targets) {
+    $still = $false
+    if ($t.UWPFamily -and $uwpSet2.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $still = $true }
+    if (-not $still -and $t.ARPName) { if ((Match-Arp $arpList2 $t.ARPName).Count -gt 0) { $still = $true } }
+    if ($still -or $t.PortableExeSignatures -or $t.InstallerSignatures) { $residual += $t }
+  }
+
+  $roots = @()
+  if ($activeUser) { $roots += (Get-PresenceZonesForUser $activeUser) }
+  $roots += (Get-ShallowCDrives)
+  $roots = $roots | Where-Object { $_ } | Select-Object -Unique
+
+  Log ("Index roots: " + ($roots -join '; '))
+
+  $fileIndex = Index-Files $roots 2
+
+  $portableVerifiedGone = $true
+  $foundAnyArtifacts = $false
+
+  foreach ($t in $residual) {
+    $stems = Build-Stems $t
+    if (-not $stems -or $stems.Count -eq 0) { continue }
+    if ($activeUser) {
+      $shortcutRemoved = Remove-QuickLaunchMatches $activeUser $stems
+      if ($shortcutRemoved) { $removedThisRun += $t.Name }
+    }
+    $hits = Find-MatchingFiles $fileIndex $stems
+    if ($hits.Count -gt 0) {
+      $foundAnyArtifacts = $true
+      Log ("Removing artifacts for " + $t.Name + " hits=" + $hits.Count)
+      Remove-Paths $hits
+      $removedThisRun += $t.Name
+      foreach ($p in $hits) { if (Test-Path $p) { $portableVerifiedGone = $false } }
     }
   }
 
-  if ($did) { $removedThisRun += $t.Name }
+  $foundAny = ($foundThisRun | Select-Object -Unique)
+  if ($foundAny.Count -gt 0 -or $foundAnyArtifacts) {
+    $state = Reset-Phase $state
+    $state.lastDetect = (Get-Date).ToString('o')
+    $state.lastFound = $foundAny
+    Update-Receipt ($removedThisRun | Select-Object -Unique)
+  } else {
+    $state = Advance-PhaseIfTime $state
+  }
+
+  $state.lastRun = (Get-Date).ToString('o')
+  Write-JsonFile $StateFile $state
+
+  if (-not $portableVerifiedGone) {
+    Log "Portable verification failed (some artifacts remain)." "WARN"
+    $scriptExitCode = 1
+  }
 }
-
-# Refresh & residual filesystem pass (portable/installer artifacts)
-$uwpSet2 = Snapshot-Uwp
-$arpList2 = Snapshot-Arp
-
-$residual = @()
-foreach ($t in $targets) {
-  $still = $false
-  if ($t.UWPFamily -and $uwpSet2.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $still = $true }
-  if (-not $still -and $t.ARPName) { if ((Match-Arp $arpList2 $t.ARPName).Count -gt 0) { $still = $true } }
-  if ($still -or $t.PortableExeSignatures -or $t.InstallerSignatures) { $residual += $t }
-}
-
-$roots = @()
-if ($activeUser) { $roots += (Get-PresenceZonesForUser $activeUser) }
-$roots += (Get-ShallowCDrives)
-$roots = $roots | Where-Object { $_ } | Select-Object -Unique
-
-Log ("Index roots: " + ($roots -join '; '))
-
-$fileIndex = Index-Files $roots 2
-
-$portableVerifiedGone = $true
-$foundAnyArtifacts = $false
-
-foreach ($t in $residual) {
-  $stems = Build-Stems $t
-  if (-not $stems -or $stems.Count -eq 0) { continue }
-  $hits = Find-MatchingFiles $fileIndex $stems
-  if ($hits.Count -gt 0) {
-    $foundAnyArtifacts = $true
-    Log ("Removing artifacts for " + $t.Name + " hits=" + $hits.Count)
-    Remove-Paths $hits
-    $removedThisRun += $t.Name
-    foreach ($p in $hits) { if (Test-Path $p) { $portableVerifiedGone = $false } }
+finally {
+  if ($mutexOwned -and $mutex) {
+    try { $mutex.ReleaseMutex() | Out-Null } catch {}
+  }
+  if ($mutex) {
+    try { $mutex.Dispose() } catch {}
   }
 }
 
-$foundAny = ($foundThisRun | Select-Object -Unique)
-if ($foundAny.Count -gt 0 -or $foundAnyArtifacts) {
-  $state = Reset-Phase $state
-  $state.lastDetect = (Get-Date).ToString('o')
-  $state.lastFound = $foundAny
-  Update-Receipt ($removedThisRun | Select-Object -Unique)
-} else {
-  $state = Advance-PhaseIfTime $state
-}
-
-$state.lastRun = (Get-Date).ToString('o')
-Write-JsonFile $StateFile $state
-
-if (-not $portableVerifiedGone) { Log "Portable verification failed (some artifacts remain)." "WARN"; exit 1 }
-exit 0
+exit $scriptExitCode
 
 '@
 
@@ -1445,30 +1574,102 @@ function Set-RsdFileAcl([string]$path) {
   } catch {}
 }
 
+
+function Remediate-Log([string]$m, [string]$lvl='INFO') {
+  try {
+    $p = Join-Path $LogDir 'remediateAGENT.log'
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    Add-Content -Path $p -Value ("{0} [{1}] {2}" -f $ts, $lvl, $m) -Encoding UTF8
+  } catch {}
+}
+
 function Register-CleanAgentTask {
-  $taskName = 'RSD Clean Agent'
+  $taskName = 'RSD-CleanAGENT'
   $taskDesc = 'RSD local cleaning agent. Runs hourly; script enforces adaptive backoff schedule.'
   $ps = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
   $args = "-NoProfile -ExecutionPolicy Bypass -File `"$AgentScript`""
+  $created = $false
 
-  $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddHours(1)
-  $trigger.RepetitionInterval = (New-TimeSpan -Hours 1)
-  $trigger.RepetitionDuration = ([TimeSpan]::MaxValue)
-
-  $action = New-ScheduledTaskAction -Execute $ps -Argument $args
-  $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 20) -MultipleInstances IgnoreNew
-  $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-  $task = New-ScheduledTask -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description $taskDesc
-
+  # If task already exists, keep it (avoid delete/recreate churn on repeated Intune runs).
   try {
-    $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    if ($existing) { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false | Out-Null }
+    schtasks /Query /TN "$taskName" /FO LIST | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+      Remediate-Log ("Existing task already present: " + $taskName)
+      try { schtasks /Run /TN "$taskName" | Out-Null } catch {}
+      return $true
+    }
   } catch {}
 
+  $useScheduledTasksModule = $true
+  foreach ($cmd in @('New-ScheduledTaskTrigger','New-ScheduledTaskAction','New-ScheduledTaskSettingsSet','New-ScheduledTaskPrincipal','New-ScheduledTask','Register-ScheduledTask')) {
+    if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) { $useScheduledTasksModule = $false; break }
+  }
+
+  if ($useScheduledTasksModule) {
+    try {
+      $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
+      $trigger.RepetitionInterval = (New-TimeSpan -Hours 1)
+      $trigger.RepetitionDuration = ([TimeSpan]::MaxValue)
+
+      $action = New-ScheduledTaskAction -Execute $ps -Argument $args
+      $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 20) -MultipleInstances IgnoreNew
+      $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+      $task = New-ScheduledTask -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description $taskDesc
+
+      Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
+      $created = $true
+      Remediate-Log "Registered task via ScheduledTasks module"
+    } catch {
+      Remediate-Log "ScheduledTasks registration failed; falling back to schtasks.exe" 'WARN'
+    }
+  } else {
+    Remediate-Log "ScheduledTasks cmdlets unavailable; using schtasks.exe fallback" 'WARN'
+  }
+
+  if (-not $created) {
+    try {
+      $tr = "`"$ps`" -NoProfile -ExecutionPolicy Bypass -File `"$AgentScript`""
+      Remediate-Log ("Creating scheduled task via schtasks: " + $taskName)
+      schtasks /Create /F /RU "SYSTEM" /RL HIGHEST /SC HOURLY /MO 1 /TN "$taskName" /TR "$tr" | Out-Null
+    } catch {
+      Remediate-Log "schtasks.exe /Create threw an exception" 'ERROR'
+    }
+  }
+
+  # Exact verification pass and immediate run
   try {
-    Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
+    schtasks /Query /TN "$taskName" /FO LIST | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+      Remediate-Log "Task present after registration: $taskName"
+      try { schtasks /Run /TN "$taskName" | Out-Null } catch {}
+      return $true
+    }
+
+    $err = (schtasks /Query /TN "$taskName" /FO LIST 2>&1 | Out-String)
+    if ($err) { Remediate-Log ("Task query error: " + $err.Trim()) 'ERROR' }
+  } catch {}
+
+  Remediate-Log "Task registration verification failed: $taskName" 'ERROR'
+  return $false
+}
+
+function Invoke-CleanAgentNow {
+  try {
+    if (-not (Test-Path $AgentScript)) { Remediate-Log "cleanAGENT script missing at runtime" 'ERROR'; return }
+    $ps = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $p = Start-Process -FilePath $ps -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$AgentScript`"" -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
+    if ($p) {
+      $done = $p.WaitForExit(600000)
+      if ($done) { Remediate-Log ("Immediate cleanAGENT run finished with exit code " + $p.ExitCode) }
+      else {
+        try { $p.Kill() } catch {}
+        Remediate-Log "Immediate cleanAGENT run timed out after 10 minutes" 'WARN'
+      }
+    } else {
+      Remediate-Log "Failed to start immediate cleanAGENT run process" 'ERROR'
+    }
   } catch {
-    schtasks /Create /F /RU SYSTEM /RL HIGHEST /SC HOURLY /MO 1 /TN "$taskName" /TR "`"$ps`" $args" | Out-Null
+    Remediate-Log "Immediate cleanAGENT run threw an exception" 'ERROR'
   }
 }
 
@@ -1482,7 +1683,8 @@ Write-FileUtf8 $TargetsPath $TargetsPayload
 Write-FileUtf8 $VersionFile $ThisVersion
 
 if (-not (Test-Path $StateFile)) {
-  $init = '{"phase":0,"phaseStart":"2026-02-27T20:42:10.010676","lastDetect":"2026-02-27T20:42:10.010681","lastRun":"2026-02-27T20:42:10.010682","lastFound":[]}'
+   $initObj = @{ phase=0; phaseStart=(Get-Date).ToString("o"); lastDetect=(Get-Date).ToString("o"); lastRun=(Get-Date).ToString("o"); lastFound=@() }
+  $init = ($initObj | ConvertTo-Json -Depth 6)
   Write-FileUtf8 $StateFile $init
 }
 
@@ -1493,8 +1695,14 @@ Set-RsdFileAcl $TargetsPath
 Set-RsdFileAcl $VersionFile
 Set-RsdFileAcl $StateFile
 
-Register-CleanAgentTask
-
-try { Start-ScheduledTask -TaskName 'RSD Clean Agent' -ErrorAction SilentlyContinue } catch {}
-
+Remediate-Log "Starting remediation deployment version $ThisVersion"
+$taskName = "RSD-CleanAGENT"
+$taskOk = Register-CleanAgentTask
+if (-not $taskOk) {
+  Remediate-Log "Remediation deployment completed with task registration failure" "ERROR"
+  exit 1
+}
+try { Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue } catch {}
+Invoke-CleanAgentNow
+Remediate-Log "Remediation deployment complete"
 exit 0
