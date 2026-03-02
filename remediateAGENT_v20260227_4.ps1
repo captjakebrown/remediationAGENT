@@ -1,0 +1,1500 @@
+<#
+RSD CleanAgent - Intune Proactive Remediation Remediation
+PowerShell 5.1 compatible
+Version: 2026.02.27.4
+
+Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
+#>
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'SilentlyContinue'
+
+$AgentRoot = 'C:\ProgramData\RSD\Agent'
+$AgentScript = Join-Path $AgentRoot 'cleanAGENT.ps1'
+$TargetsPath = Join-Path $AgentRoot 'targets.json'
+$VersionFile = Join-Path $AgentRoot 'version.txt'
+$StateFile   = Join-Path $AgentRoot 'state.json'
+$LogDir      = Join-Path $AgentRoot 'Logs'
+
+$ThisVersion = '2026.02.27.4'
+
+$AgentPayload = @'
+<#
+RSD CleanAgent (local) - PowerShell 5.1
+Version: 2026.02.27.4
+
+Behavior:
+- Batch inventory UWP/ARP once per run.
+- Removes UWP packages found.
+- Removes ARP apps ONLY via QuietUninstallString (no invented quiet args).
+- Builds a residual set and does a single bounded filesystem index pass for portable/installer artifacts.
+- Backoff schedule is enforced via state.json:
+    Phase 0: every hour for 24h
+    Phase 1: every 2h for next 24h
+    Phase 2: every 4h for next 24h
+    Phase 3: once daily at 09:00 local IF clean; if forbidden apps detected, reset to Phase 0.
+- Writes debug log to C:\ProgramData\RSD\Agent\Logs
+- Writes receipt RSD ATTN.log on user desktop (OneDrive Desktop preferred), ACL-hardened and readable by Users.
+
+Runs as SYSTEM via Task Scheduler.
+#>
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'SilentlyContinue'
+
+$AgentRoot = 'C:\ProgramData\RSD\Agent'
+$TargetsPath = Join-Path $AgentRoot 'targets.json'
+$StateFile   = Join-Path $AgentRoot 'state.json'
+$LogDir      = Join-Path $AgentRoot 'Logs'
+if (-not (Test-Path $LogDir)) { New-Item -Path $LogDir -ItemType Directory -Force | Out-Null }
+
+$logPath = Join-Path $LogDir ("cleanAGENT_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+
+function Log([string]$m, [string]$lvl='INFO') {
+  $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+  try { Add-Content -Path $logPath -Value ("{0} [{1}] {2}" -f $ts, $lvl, $m) -Encoding UTF8 } catch {}
+}
+
+function Read-JsonFile([string]$path, $fallback) {
+  if (-not (Test-Path $path)) { return $fallback }
+  try { return (Get-Content -Raw -Path $path -Encoding UTF8 | ConvertFrom-Json) } catch { return $fallback }
+}
+
+function Write-JsonFile([string]$path, $obj) {
+  try { ($obj | ConvertTo-Json -Depth 8) | Set-Content -Path $path -Encoding UTF8 } catch {}
+}
+
+function Disable-OneDriveDeletePrompt {
+  try {
+    $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive'
+    if (-not (Test-Path $policyPath)) { New-Item -Path $policyPath -Force | Out-Null }
+    Set-ItemProperty -Path $policyPath -Name 'DisableFirstDeleteDialog' -Value 1 -Type DWord
+  } catch {}
+}
+
+function Is-DueToRun($state) {
+  $now = Get-Date
+  $phase = [int]($state.phase)
+  if ($phase -eq 0) { return $true }
+  if ($phase -eq 1) { return (($now.Hour % 2) -eq 0) }
+  if ($phase -eq 2) { return (($now.Hour % 4) -eq 0) }
+  return ($now.Hour -eq 9)
+}
+
+function Advance-PhaseIfTime($state) {
+  $now = Get-Date
+  $phase = [int]($state.phase)
+  $phaseStart = Get-Date ($state.phaseStart)
+  if (-not $phaseStart) { $state.phase = 0; $state.phaseStart = $now.ToString("o"); return $state }
+  $elapsedHours = (New-TimeSpan -Start $phaseStart -End $now).TotalHours
+  if ($phase -eq 0 -and $elapsedHours -ge 24) { $state.phase = 1; $state.phaseStart = $now.ToString("o") }
+  elseif ($phase -eq 1 -and $elapsedHours -ge 24) { $state.phase = 2; $state.phaseStart = $now.ToString("o") }
+  elseif ($phase -eq 2 -and $elapsedHours -ge 24) { $state.phase = 3; $state.phaseStart = $now.ToString("o") }
+  return $state
+}
+
+function Reset-Phase($state) { $state.phase = 0; $state.phaseStart = (Get-Date).ToString("o"); return $state }
+
+function Get-ActiveUser() {
+  try {
+    $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
+    if ($cs -and $cs.UserName) { return $cs.UserName.Split('\')[-1] }
+  } catch {}
+  return $null
+}
+
+function Get-DesktopPathForUser([string]$user) {
+  if (-not $user) { return $null }
+  $one = "C:\Users\{0}\OneDrive - Riverview School District\Desktop" -f $user
+  $loc = "C:\Users\{0}\Desktop" -f $user
+  if (Test-Path $one) { return $one }
+  if (Test-Path $loc) { return $loc }
+  return $null
+}
+
+function Ensure-ReceiptAcl([string]$p) {
+  try { (Get-Item $p -ErrorAction SilentlyContinue).Attributes = 'ReadOnly' } catch {}
+  try {
+    icacls $p /inheritance:r | Out-Null
+    icacls $p /grant:r "Users:(RX)" "Administrators:(F)" "SYSTEM:(F)" | Out-Null
+    icacls $p /deny "Users:(W,WDAC,WO,D,DC)" | Out-Null
+  } catch {}
+}
+
+function Update-Receipt([string[]]$removedApps) {
+  if (-not $removedApps -or $removedApps.Count -eq 0) { return }
+  $user = Get-ActiveUser
+  $desk = Get-DesktopPathForUser $user
+  if (-not $desk) { return }
+  $receipt = Join-Path $desk 'RSD ATTN.log'
+  $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+  $list = ($removedApps | Sort-Object -Unique) -join ', '
+  $line = "$ts - Removed: $list"
+  if (-not (Test-Path $receipt)) {
+    try {
+      Set-Content -Path $receipt -Value "Forbidden software has been removed from your computer." -Encoding UTF8
+      Add-Content -Path $receipt -Value ("Removed: " + $list) -Encoding UTF8
+      Add-Content -Path $receipt -Value "If additional forbidden software is discovered in the future, school administration will determine appropriate discipline." -Encoding UTF8
+      Add-Content -Path $receipt -Value "" -Encoding UTF8
+      Add-Content -Path $receipt -Value $line -Encoding UTF8
+    } catch {}
+  } else {
+    try { Add-Content -Path $receipt -Value $line -Encoding UTF8 } catch {}
+  }
+  Ensure-ReceiptAcl $receipt
+}
+
+function Get-Targets() {
+  $t = Read-JsonFile $TargetsPath @()
+  if ($t -isnot [System.Array]) { return @() + $t }
+  return $t
+}
+
+function Snapshot-Uwp() {
+  $set = @{}
+  try { Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | ForEach-Object { $set[$_.PackageFamilyName.ToLowerInvariant()] = $_ } } catch {}
+  return $set
+}
+
+function Snapshot-Arp() {
+  $list = @()
+  $paths = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+  )
+  foreach ($p in $paths) {
+    try { Get-ItemProperty -Path $p -ErrorAction SilentlyContinue | ForEach-Object { if ($_.DisplayName) { $list += $_ } } } catch {}
+  }
+  return $list
+}
+
+function Match-Arp($arpList, $pattern) {
+  if (-not $pattern) { return @() }
+  return @($arpList | Where-Object { $_.DisplayName -like $pattern })
+}
+
+function Remove-UwpFamily($family) {
+  if (-not $family) { return $false }
+  $removed = $false
+  try {
+    $pkgs = Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Where-Object { $_.PackageFamilyName -eq $family }
+    foreach ($p in $pkgs) {
+      Log ("Removing UWP: " + $p.PackageFullName)
+      try { Remove-AppxPackage -Package $p.PackageFullName -AllUsers -ErrorAction SilentlyContinue } catch {}
+      $removed = $true
+    }
+  } catch {}
+  try {
+    Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
+      Where-Object { $_.PackageFamilyName -eq $family } |
+      ForEach-Object { try { Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -ErrorAction SilentlyContinue } catch {} }
+  } catch {}
+  return $removed
+}
+
+function Invoke-QuietUninstall($q) {
+  if (-not $q) { return $false }
+  try { Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"$q`"" -Wait -WindowStyle Hidden; return $true } catch { return $false }
+}
+
+function Get-ProfileRootForUser([string]$user) {
+  if (-not $user) { return $null }
+  $p = "C:\Users\{0}" -f $user
+  if (Test-Path $p) { return $p }
+  return $null
+}
+
+function Get-PresenceZonesForUser([string]$user) {
+  $root = Get-ProfileRootForUser $user
+  if (-not $root) { return @() }
+  $zones = @()
+  $od = Join-Path $root 'OneDrive - Riverview School District'
+  $deskOD = Join-Path $od 'Desktop'
+  $docOD  = Join-Path $od 'Documents'
+  $deskL  = Join-Path $root 'Desktop'
+  $docL   = Join-Path $root 'Documents'
+  $dl     = Join-Path $root 'Downloads'
+  $pic    = Join-Path $root 'Pictures'
+  if (Test-Path $deskOD) { $zones += $deskOD } elseif (Test-Path $deskL) { $zones += $deskL }
+  if (Test-Path $docOD)  { $zones += $docOD }  elseif (Test-Path $docL)  { $zones += $docL }
+  if (Test-Path $dl) { $zones += $dl }
+  if (Test-Path $pic){ $zones += $pic }
+  return ($zones | Select-Object -Unique)
+}
+
+function Get-ShallowCDrives() {
+  $skip = @('windows','program files','program files (x86)','programdata','users','perflogs','recovery','system volume information','$recycle.bin','msocache')
+  $out = @()
+  try {
+    Get-ChildItem -Path 'C:\' -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
+      $n = $_.Name.ToLowerInvariant()
+      if ($skip -notcontains $n) { $out += $_.FullName }
+    }
+  } catch {}
+  return $out
+}
+
+function Build-Stems($t) {
+  $stems = New-Object System.Collections.Generic.List[string]
+  foreach ($sig in @($t.PortableExeSignatures, $t.InstallerSignatures)) {
+    if (-not $sig) { continue }
+    $pn = $sig.ProductName
+    $of = $sig.OriginalFilename
+    if ($pn) {
+      $stems.Add($pn)
+      $stems.Add(($pn -replace '[\s\.\-_]',''))
+    } elseif ($of) {
+      try {
+        $base = [System.IO.Path]::GetFileNameWithoutExtension([System.IO.Path]::GetFileName($of))
+        if ($base) { $stems.Add($base); $stems.Add(($base -replace '[\s\.\-_]','')) }
+      } catch {}
+    }
+  }
+  return ($stems | Where-Object { $_ -and $_.Length -ge 4 } | Select-Object -Unique | Select-Object -First 10)
+}
+
+function Index-Files($roots, $maxDepth) {
+  $idx = @{}
+  $exts = @('exe','msi','zip','7z','rar','msix','appx','appxbundle','msixbundle')
+  foreach ($r in $roots) {
+    if (-not (Test-Path $r)) { continue }
+    $queue = New-Object System.Collections.Queue
+    $queue.Enqueue(@($r, 0))
+    while ($queue.Count -gt 0) {
+      $it = $queue.Dequeue()
+      $p = $it[0]; $d = [int]$it[1]
+      foreach ($e in $exts) {
+        try {
+          Get-ChildItem -LiteralPath $p -File -Force -Filter "*.$e" -ErrorAction SilentlyContinue | ForEach-Object {
+            $name = $_.Name.ToLowerInvariant()
+            if (-not $idx.ContainsKey($name)) { $idx[$name] = @() }
+            $idx[$name] += $_.FullName
+          }
+        } catch {}
+      }
+      if ($d -ge $maxDepth) { continue }
+      try {
+        Get-ChildItem -LiteralPath $p -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
+          if (($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return }
+          $queue.Enqueue(@($_.FullName, $d + 1))
+        }
+      } catch {}
+    }
+  }
+  return $idx
+}
+
+function Find-MatchingFiles($fileIndex, [string[]]$stems) {
+  $hits = @()
+  if (-not $stems -or $stems.Count -eq 0) { return $hits }
+  foreach ($k in $fileIndex.Keys) {
+    foreach ($s in $stems) {
+      $ss = $s.ToLowerInvariant()
+      if ($ss.Length -le 6) { if ($k -like ($ss + '*')) { $hits += $fileIndex[$k] } }
+      else { if ($k -like ('*' + $ss + '*')) { $hits += $fileIndex[$k] } }
+    }
+  }
+  return ($hits | Select-Object -Unique)
+}
+
+function Remove-Paths([string[]]$paths) {
+  foreach ($p in $paths) {
+    try { if (Test-Path $p) { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue } } catch {}
+  }
+}
+
+# MAIN
+Disable-OneDriveDeletePrompt
+
+$state = Read-JsonFile $StateFile @{ phase=0; phaseStart=(Get-Date).ToString('o'); lastDetect=(Get-Date).ToString('o'); lastRun=(Get-Date).ToString('o'); lastFound=@() }
+$state = Advance-PhaseIfTime $state
+
+if (-not (Is-DueToRun $state)) {
+  $state.lastRun = (Get-Date).ToString('o')
+  Write-JsonFile $StateFile $state
+  exit 0
+}
+
+$activeUser = Get-ActiveUser
+Log ("Active user: " + $activeUser)
+
+$targets = Get-Targets
+if (-not $targets -or $targets.Count -eq 0) {
+  Log "targets.json missing/empty." "WARN"
+  $state.lastRun = (Get-Date).ToString('o')
+  Write-JsonFile $StateFile $state
+  exit 0
+}
+
+$uwpSet = Snapshot-Uwp
+$arpList = Snapshot-Arp
+
+$foundThisRun = @()
+$removedThisRun = @()
+
+# Pass 1: remove UWP + quiet ARP
+foreach ($t in $targets) {
+  $present = $false
+  if ($t.UWPFamily -and $uwpSet.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $present = $true; $foundThisRun += $t.Name }
+  if (-not $present -and $t.ARPName) {
+    if ((Match-Arp $arpList $t.ARPName).Count -gt 0) { $present = $true; $foundThisRun += $t.Name }
+  }
+  if (-not $present) { continue }
+
+  $did = $false
+  if ($t.UWPFamily) { $did = (Remove-UwpFamily $t.UWPFamily) -or $did }
+
+  if ($t.ARPName) {
+    $matches = Match-Arp $arpList $t.ARPName
+    foreach ($e in $matches) {
+      if ($e.QuietUninstallString) {
+        Log ("Quiet uninstall ARP: " + $e.DisplayName)
+        $ok = Invoke-QuietUninstall $e.QuietUninstallString
+        if ($ok) { $did = $true } else { Log ("Quiet uninstall failed: " + $e.DisplayName) "WARN" }
+      } else {
+        Log ("No QuietUninstallString for: " + $e.DisplayName) "WARN"
+      }
+    }
+  }
+
+  if ($did) { $removedThisRun += $t.Name }
+}
+
+# Refresh & residual filesystem pass (portable/installer artifacts)
+$uwpSet2 = Snapshot-Uwp
+$arpList2 = Snapshot-Arp
+
+$residual = @()
+foreach ($t in $targets) {
+  $still = $false
+  if ($t.UWPFamily -and $uwpSet2.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $still = $true }
+  if (-not $still -and $t.ARPName) { if ((Match-Arp $arpList2 $t.ARPName).Count -gt 0) { $still = $true } }
+  if ($still -or $t.PortableExeSignatures -or $t.InstallerSignatures) { $residual += $t }
+}
+
+$roots = @()
+if ($activeUser) { $roots += (Get-PresenceZonesForUser $activeUser) }
+$roots += (Get-ShallowCDrives)
+$roots = $roots | Where-Object { $_ } | Select-Object -Unique
+
+Log ("Index roots: " + ($roots -join '; '))
+
+$fileIndex = Index-Files $roots 2
+
+$portableVerifiedGone = $true
+$foundAnyArtifacts = $false
+
+foreach ($t in $residual) {
+  $stems = Build-Stems $t
+  if (-not $stems -or $stems.Count -eq 0) { continue }
+  $hits = Find-MatchingFiles $fileIndex $stems
+  if ($hits.Count -gt 0) {
+    $foundAnyArtifacts = $true
+    Log ("Removing artifacts for " + $t.Name + " hits=" + $hits.Count)
+    Remove-Paths $hits
+    $removedThisRun += $t.Name
+    foreach ($p in $hits) { if (Test-Path $p) { $portableVerifiedGone = $false } }
+  }
+}
+
+$foundAny = ($foundThisRun | Select-Object -Unique)
+if ($foundAny.Count -gt 0 -or $foundAnyArtifacts) {
+  $state = Reset-Phase $state
+  $state.lastDetect = (Get-Date).ToString('o')
+  $state.lastFound = $foundAny
+  Update-Receipt ($removedThisRun | Select-Object -Unique)
+} else {
+  $state = Advance-PhaseIfTime $state
+}
+
+$state.lastRun = (Get-Date).ToString('o')
+Write-JsonFile $StateFile $state
+
+if (-not $portableVerifiedGone) { Log "Portable verification failed (some artifacts remain)." "WARN"; exit 1 }
+exit 0
+
+'@
+
+# Replace this payload with your current targets.json (or let the agent use an external managed file)
+$TargetsPayload = @'
+[
+    {
+        "Name":  "Angry Birds 2",
+        "UWPFamily":  "1ED5AEA5.4160926B82DB_p2gbknwb5d8r2",
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  {
+                                    "ProductName":  "Store Installer",
+                                    "CompanyName":  "Microsoft Corporation",
+                                    "OriginalFilename":  "Angry Birds 2 Installer.exe",
+                                    "CertThumbprint":  "A85A56572A16C89BE458C5B22D11877071586023",
+                                    "SignerSimpleName":  "Microsoft Corporation",
+                                    "FileDescriptions":  "Store Installer Angry Birds 2 Installer.exe"
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  "1ED5AEA5.4160926B82DB_p2gbknwb5d8r2"
+    },
+    {
+        "Name":  "Autoclicker",
+        "UWPFamily":  null,
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  {
+                                    "ProductName":  "OP Auto Clicker",
+                                    "CompanyName":  null,
+                                    "OriginalFilename":  "AutoClicker-*.exe",
+                                    "CertThumbprint":  "562E77844B63A3EAB2B2B6D77A76DCFA52DD9846",
+                                    "SignerSimpleName":  "AMSTION LIMITED",
+                                    "FileDescriptions":  "OP Auto Clicker Auto Clicker-*.exe"
+                                },
+        "PortableExeSignatures":  {
+                                      "ProductName":  "OP Auto Clicker",
+                                      "CompanyName":  null,
+                                      "OriginalFilename":  null,
+                                      "CertThumbprint":  "562E77844B63A3EAB2B2B6D77A76DCFA52DD9846",
+                                      "SignerSimpleName":  "AMSTION LIMITED",
+                                      "FileDescriptions":  "OP Auto Clicker"
+                                  },
+        "PathAnchors":  null
+    },
+    {
+        "Name":  "AVG Secure Browser",
+        "UWPFamily":  null,
+        "ARPName":  "AVG Secure Browser*",
+        "Publisher":  "Gen Digital Inc.",
+        "InstallerSignatures":  {
+                                    "ProductName":  "AVG Secure Browser Setup",
+                                    "CompanyName":  "Gen Digital Inc.",
+                                    "OriginalFilename":  "avg_secure_browser_setup.exe",
+                                    "CertThumbprint":  "79A1F7262575EC7D1304F9CDAC161C91DA814B87",
+                                    "SignerSimpleName":  "AVG Technologies USA",
+                                    "FileDescriptions":  "AVG Secure Browser Setupavg_secure_browser_setup.exe"
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            "AVG Secure Browser",
+                            "Gen Digital Inc."
+                        ]
+    },
+    {
+        "Name":  "BlueStacks",
+        "UWPFamily":  null,
+        "ARPName":  "BlueStacks*",
+        "Publisher":  "now.gg, Inc.",
+        "InstallerSignatures":  {
+                                    "ProductName":  "BlueStacks 5",
+                                    "CompanyName":  "now.gg, Inc.",
+                                    "OriginalFilename":  "BlueStacksInstaller_*_native_b2a81b8bb*e90d9fc*_MzsxNSwwOzUsMTsxNSw0OzE1LDU7MTU=.exe",
+                                    "CertThumbprint":  "19FE0C50C1E150B1C044D1AC3AC2E8E886E00AA1",
+                                    "SignerSimpleName":  "Now.gg",
+                                    "FileDescriptions":  "Blue Stacks Setup Blue Stacks Installer_*_native_b2a81b8bb*e90d9fc*_Mzsx NSww Oz Us MTsx NSw0Oz E1LDU7MTU=.exe"
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            "BlueStacks Store",
+                            "BlueStacks X",
+                            "BlueStacks_nxt",
+                            "bluestacks-services",
+                            "now.gg, Inc."
+                        ]
+    },
+    {
+        "Name":  "Brave",
+        "UWPFamily":  null,
+        "ARPName":  "Brave*",
+        "Publisher":  "Brave Software Inc",
+        "InstallerSignatures":  {
+                                    "ProductName":  "BraveSoftware Update",
+                                    "CompanyName":  "BraveSoftware Inc.",
+                                    "OriginalFilename":  "BraveBrowserSetup-BRV*.exe",
+                                    "CertThumbprint":  "F8AC5F11DE7E26383B7A389FC19A2613835799D7",
+                                    "SignerSimpleName":  "Brave Software",
+                                    "FileDescriptions":  "Brave Software Update Setup Brave Browser Setup-BRV*.exe"
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            "Brave Browser",
+                            "Brave Software Inc",
+                            "Brave Software, Inc.",
+                            "Brave-Browser",
+                            "BraveSoftware"
+                        ]
+    },
+    {
+        "Name":  "Craftmine",
+        "UWPFamily":  null,
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  null,
+        "PortableExeSignatures":  {
+                                      "ProductName":  "CraftMine - Definitive Edition",
+                                      "CompanyName":  null,
+                                      "OriginalFilename":  null,
+                                      "CertThumbprint":  null,
+                                      "SignerSimpleName":  null,
+                                      "FileDescriptions":  null
+                                  },
+        "PathAnchors":  [
+                            "CraftMine - Definitive Edition",
+                            "minecraft-*-alpha.25.14.craftmine-*",
+                            "Simply Craftmine"
+                        ]
+    },
+    {
+        "Name":  "CurseForge",
+        "UWPFamily":  null,
+        "ARPName":  "CurseForge*",
+        "Publisher":  "Overwolf",
+        "InstallerSignatures":  {
+                                    "ProductName":  "Curseforge",
+                                    "CompanyName":  "Overwolf Ltd.",
+                                    "OriginalFilename":  "CurseForge Windows - Installer.exe",
+                                    "CertThumbprint":  "962A9D59796B8C6AE1A7D8FAE72EC3729A898814",
+                                    "SignerSimpleName":  "Overwolf Ltd",
+                                    "FileDescriptions":  "Curseforge Curse Forge Windows - Installer.exe"
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            "CurseForge",
+                            "CurseForge Windows",
+                            "curseforge-updater",
+                            "Overwolf"
+                        ]
+    },
+    {
+        "Name":  "Discord",
+        "UWPFamily":  null,
+        "ARPName":  "Discord*",
+        "Publisher":  "Discord Inc.",
+        "InstallerSignatures":  {
+                                    "ProductName":  "Discord - https://discord.com/",
+                                    "CompanyName":  "Discord Inc.",
+                                    "OriginalFilename":  "DiscordSetup.exe",
+                                    "CertThumbprint":  "6C7552617E892DFCA5CEB96FA2870F4F1904820E",
+                                    "SignerSimpleName":  "Discord Inc.",
+                                    "FileDescriptions":  "Discord - https://discord.com/Discord Setup.exe"
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            "Discord",
+                            "Discord Inc."
+                        ]
+    },
+    {
+        "Name":  "Dragon City",
+        "UWPFamily":  "SocialPoint.DragonCityMobile_jahftqv9k5jer",
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  {
+                                    "ProductName":  "Store Installer",
+                                    "CompanyName":  "Microsoft Corporation",
+                                    "OriginalFilename":  "Dragon City Installer.exe",
+                                    "CertThumbprint":  "CB603439DC30897FCED64CA353AA902DBD3540E3",
+                                    "SignerSimpleName":  "Microsoft Corporation",
+                                    "FileDescriptions":  "Store Installer Dragon City Installer.exe"
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            "DragonCity",
+                            "Social Point",
+                            "SocialPoint.DragonCityMobile_*"
+                        ]
+    },
+    {
+        "Name":  "DuckDuckGo",
+        "UWPFamily":  "DuckDuckGo.DesktopBrowser_ya2fgkz3nks94",
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  {
+                                    "ProductName":  "DuckDuckGo® Browser Installer",
+                                    "CompanyName":  "DuckDuckGo LLC",
+                                    "OriginalFilename":  "DuckDuckGo.Installer.exe",
+                                    "CertThumbprint":  "69441D863214355EC15AEE0164ACCDEE3CEFC373",
+                                    "SignerSimpleName":  "Duck Duck Go",
+                                    "FileDescriptions":  "Duck Duck Go.Installer Duck Duck Go.Installer.exe"
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  "DuckDuckGo.DesktopBrowser_ya2fgkz3nks94"
+    },
+    {
+        "Name":  "Endless Sky",
+        "UWPFamily":  null,
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  {
+                                    "ProductName":  "Endless Sky",
+                                    "CompanyName":  null,
+                                    "OriginalFilename":  "Endless Sky.exe",
+                                    "CertThumbprint":  null,
+                                    "SignerSimpleName":  null,
+                                    "FileDescriptions":  [
+                                                             "Space exploration and combat game",
+                                                             "Endless Sky",
+                                                             "Endless Sky.exe"
+                                                         ]
+                                },
+        "PortableExeSignatures":  {
+                                      "ProductName":  "Endless Sky",
+                                      "CompanyName":  null,
+                                      "OriginalFilename":  "Endless Sky.exe",
+                                      "CertThumbprint":  null,
+                                      "SignerSimpleName":  null,
+                                      "FileDescriptions":  [
+                                                               "Space exploration and combat game",
+                                                               "Endless Sky"
+                                                           ]
+                                  },
+        "PathAnchors":  [
+                            "endless-sky*",
+                            "EndlessSky-win64-v0.10.16",
+                            "https_endless-sky.fandom.com_0.indexeddb.leveldb"
+                        ]
+    },
+    {
+        "Name":  "eve-online",
+        "UWPFamily":  null,
+        "ARPName":  "eve-online*",
+        "Publisher":  "CCP ehf",
+        "InstallerSignatures":  {
+                                    "ProductName":  "A launcher for EVE Online",
+                                    "CompanyName":  "CCP ehf",
+                                    "OriginalFilename":  "eve-online-latest+Setup.exe",
+                                    "CertThumbprint":  "BE688C28E20108AB16E53BA40990765EE8536F2B",
+                                    "SignerSimpleName":  "CCP ehf.",
+                                    "FileDescriptions":  "A launcher for EVE Onlineeve-online-latest+Setup.exe"
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            "CCP ehf",
+                            "EVE Online",
+                            "eve-online"
+                        ]
+    },
+    {
+        "Name":  "FCEUX",
+        "UWPFamily":  null,
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  {
+                                    "ProductName":  null,
+                                    "CompanyName":  null,
+                                    "OriginalFilename":  "fceux.exe",
+                                    "CertThumbprint":  null,
+                                    "SignerSimpleName":  null,
+                                    "FileDescriptions":  "fceux.exe"
+                                },
+        "PortableExeSignatures":  {
+                                      "ProductName":  "fceux",
+                                      "CompanyName":  null,
+                                      "OriginalFilename":  null,
+                                      "CertThumbprint":  null,
+                                      "SignerSimpleName":  null,
+                                      "FileDescriptions":  null
+                                  },
+        "PathAnchors":  "fceux*"
+    },
+    {
+        "Name":  "Free Download Manager",
+        "UWPFamily":  null,
+        "ARPName":  "Free Download Manager*",
+        "Publisher":  "Softdeluxe",
+        "InstallerSignatures":  {
+                                    "ProductName":  "Free Download Manager",
+                                    "CompanyName":  "Softdeluxe",
+                                    "OriginalFilename":  null,
+                                    "CertThumbprint":  "F145211219978C65FF322D9C16EC82FA90F88671",
+                                    "SignerSimpleName":  "E=administrator@softdeluxe.com",
+                                    "FileDescriptions":  "Free Download Manager Setup"
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            "Free Download Manager",
+                            "Softdeluxe"
+                        ]
+    },
+    {
+        "Name":  "game",
+        "UWPFamily":  null,
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  {
+                                    "ProductName":  "mkxp-z",
+                                    "CompanyName":  null,
+                                    "OriginalFilename":  "Game-performance.exe",
+                                    "CertThumbprint":  null,
+                                    "SignerSimpleName":  null,
+                                    "FileDescriptions":  "Game-performance.exe"
+                                },
+        "PortableExeSignatures":  {
+                                      "ProductName":  "mkxp-z",
+                                      "CompanyName":  null,
+                                      "OriginalFilename":  "mkxp-z.exe",
+                                      "CertThumbprint":  null,
+                                      "SignerSimpleName":  null,
+                                      "FileDescriptions":  null
+                                  },
+        "PathAnchors":  [
+                            "003_Game processing",
+                            "004_Game classes",
+                            "https_count-masters-stickman-games.game-files.crazygames.com_0.indexeddb.leveldb",
+                            "https_gamesfrog.com_0.indexeddb.leveldb",
+                            "https_ragdoll-archers.game-files.crazygames.com_0.indexeddb.leveldb",
+                            "https_survival-rush.game-files.crazygames.com_0.indexeddb.leveldb"
+                        ]
+    },
+    {
+        "Name":  "Gang Beasts",
+        "UWPFamily":  "DoubleFineProductionsInc.GangBeasts_s9zt93y1rpe5a",
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  null,
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            "DoubleFineProductionsInc.GangBeasts_*",
+                            "Gang Beasts"
+                        ]
+    },
+    {
+        "Name":  "GeometryDash",
+        "UWPFamily":  null,
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  {
+                                    "ProductName":  null,
+                                    "CompanyName":  null,
+                                    "OriginalFilename":  "GeometryDash.exe",
+                                    "CertThumbprint":  null,
+                                    "SignerSimpleName":  null,
+                                    "FileDescriptions":  "Geometry Dash.exe"
+                                },
+        "PortableExeSignatures":  {
+                                      "ProductName":  null,
+                                      "CompanyName":  null,
+                                      "OriginalFilename":  "GeometryDash",
+                                      "CertThumbprint":  null,
+                                      "SignerSimpleName":  null,
+                                      "FileDescriptions":  "GeometryDash"
+                                  },
+        "PathAnchors":  "Geometry DashGeometryDash"
+    },
+    {
+        "Name":  "Google Play Games",
+        "UWPFamily":  null,
+        "ARPName":  "Google Play Games*",
+        "Publisher":  "Google LLC",
+        "InstallerSignatures":  null,
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            "Apps",
+                            "Google Play Games",
+                            "Google.Play.Games",
+                            "Install-Clash Royale-GooglePlayGames*",
+                            "Install-Drift Max Pro Car Racing Game-GooglePlayGames*",
+                            "Install-Geometry Dash Lite-GooglePlayGames*",
+                            "Install-Hill Climb Racing-GooglePlayGames*",
+                            "Play Games"
+                        ]
+    },
+    {
+        "Name":  "Hill Climb Racing",
+        "UWPFamily":  "FINGERSOFT.HILLCLIMBRACING_r6rtpscs7gwyg",
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  {
+                                    "ProductName":  "Store Installer",
+                                    "CompanyName":  "Microsoft Corporation",
+                                    "OriginalFilename":  "Hill Climb Racing Installer.exe",
+                                    "CertThumbprint":  "CB603439DC30897FCED64CA353AA902DBD3540E3",
+                                    "SignerSimpleName":  "Microsoft Corporation",
+                                    "FileDescriptions":  "Store Installer Hill Climb Racing Installer.exe"
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            "FINGERSOFT.HILLCLIMBRACING_*",
+                            "HCR-Trainer"
+                        ]
+    },
+    {
+        "Name":  "Instagram",
+        "UWPFamily":  "Facebook.InstagramBeta_8xx8rvfyw5nnt",
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  null,
+        "PortableExeSignatures":  null,
+        "PathAnchors":  "Facebook.InstagramBeta_*"
+    },
+    {
+        "Name":  "Lively",
+        "UWPFamily":  "12030rocksdanister.LivelyWallpaper_97hta09mmv6hy",
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  {
+                                    "ProductName":  "Store Installer",
+                                    "CompanyName":  "Microsoft Corporation",
+                                    "OriginalFilename":  "Lively Wallpaper Installer.exe",
+                                    "CertThumbprint":  "CB603439DC30897FCED64CA353AA902DBD3540E3",
+                                    "SignerSimpleName":  "Microsoft Corporation",
+                                    "FileDescriptions":  "Store Installer Lively Wallpaper Installer.exe"
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            "12030rocksdanister.LivelyWallpaper_*",
+                            "Lively Wallpaper"
+                        ]
+    },
+    {
+        "Name":  "Lunar Client",
+        "UWPFamily":  null,
+        "ARPName":  "Uninstall Lunar Client*",
+        "Publisher":  "Moonsworth LLC",
+        "InstallerSignatures":  {
+                                    "ProductName":  "Lunar Client",
+                                    "CompanyName":  "Overwolf Ltd.",
+                                    "OriginalFilename":  "Lunar Client - Installer.exe",
+                                    "CertThumbprint":  "962A9D59796B8C6AE1A7D8FAE72EC3729A898814",
+                                    "SignerSimpleName":  "Overwolf Ltd",
+                                    "FileDescriptions":  "Lunar Client Lunar Client - Installer.exe"
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            ".lunarclient",
+                            "Lunar Client",
+                            "lunarclient",
+                            "lunarclient-updater",
+                            "Moonsworth LLC"
+                        ]
+    },
+    {
+        "Name":  "mGBA",
+        "UWPFamily":  null,
+        "ARPName":  "mGBA*",
+        "Publisher":  "Jeffrey Pfau",
+        "InstallerSignatures":  null,
+        "PortableExeSignatures":  {
+                                      "ProductName":  null,
+                                      "CompanyName":  null,
+                                      "OriginalFilename":  "mgba",
+                                      "CertThumbprint":  null,
+                                      "SignerSimpleName":  null,
+                                      "FileDescriptions":  "mgba"
+                                  },
+        "PathAnchors":  [
+                            "Jeffrey Pfau",
+                            "mGBA",
+                            "mGBA-*-win32-installer",
+                            "shaders"
+                        ]
+    },
+    {
+        "Name":  "Minecraft for Windows",
+        "UWPFamily":  "MICROSOFT.MINECRAFTUWP_8wekyb3d8bbwe",
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  {
+                                    "ProductName":  "MinecraftInstaller",
+                                    "CompanyName":  "Microsoft Corporation",
+                                    "OriginalFilename":  "MinecraftInstaller.exe",
+                                    "CertThumbprint":  null,
+                                    "SignerSimpleName":  null,
+                                    "FileDescriptions":  "Minecraft Installer"
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            "Minecraft for Windows",
+                            "Minecraft Launcher",
+                            "MinecraftLauncher"
+                        ]
+    },
+    {
+        "Name":  "Minecraft Launcher",
+        "UWPFamily":  null,
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  null,
+        "PortableExeSignatures":  {
+                                      "ProductName":  null,
+                                      "CompanyName":  null,
+                                      "OriginalFilename":  "Minecraft Launcher",
+                                      "CertThumbprint":  null,
+                                      "SignerSimpleName":  null,
+                                      "FileDescriptions":  "Minecraft Launcher"
+                                  },
+        "PathAnchors":  "Minecraft Launcher"
+    },
+    {
+        "Name":  "Modrinth App",
+        "UWPFamily":  null,
+        "ARPName":  "Modrinth App*",
+        "Publisher":  "ModrinthApp",
+        "InstallerSignatures":  {
+                                    "ProductName":  "Modrinth App",
+                                    "CompanyName":  null,
+                                    "OriginalFilename":  "Modrinth App_*_x64-setup.exe",
+                                    "CertThumbprint":  "F82EABB60BB01A0DB764F4E3A737FC1483EC4434",
+                                    "SignerSimpleName":  "Rinth",
+                                    "FileDescriptions":  "Modrinth App Modrinth App_*_x64-setup.exe"
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            "Modrinth App",
+                            "Modrinth App-0.10.15-updater-SJXQCk",
+                            "ModrinthApp"
+                        ]
+    },
+    {
+        "Name":  "Mozilla Firefox",
+        "UWPFamily":  null,
+        "ARPName":  "Mozilla Firefox (x64 en-US)*",
+        "Publisher":  "Mozilla",
+        "InstallerSignatures":  {
+                                    "ProductName":  "Firefox",
+                                    "CompanyName":  "Mozilla",
+                                    "OriginalFilename":  "Firefox Installer.exe",
+                                    "CertThumbprint":  "40890F2FE1ACAE18072FA7F3C0AE456AACC8570D",
+                                    "SignerSimpleName":  "Mozilla Corporation",
+                                    "FileDescriptions":  "Firefox Firefox Installer.exe"
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            "Firefox",
+                            "Mozilla",
+                            "Mozilla Firefox",
+                            "Old Firefox Data"
+                        ]
+    },
+    {
+        "Name":  "Opera Air Stable",
+        "UWPFamily":  null,
+        "ARPName":  "Opera Air Stable*",
+        "Publisher":  "Opera Software",
+        "InstallerSignatures":  {
+                                    "ProductName":  "Opera installer",
+                                    "CompanyName":  null,
+                                    "OriginalFilename":  "OperaAirSetup.exe",
+                                    "CertThumbprint":  "25F4C2A374C779AB087B79B7740216416CAF0EE0",
+                                    "SignerSimpleName":  "Opera Norway AS",
+                                    "FileDescriptions":  [
+                                                             "Opera installer SFX",
+                                                             "Opera Air Setup.exe"
+                                                         ]
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            "Opera Air",
+                            "Opera Air Stable",
+                            "Opera Software"
+                        ]
+    },
+    {
+        "Name":  "Opera GX Stable",
+        "UWPFamily":  null,
+        "ARPName":  "Opera GX Stable*",
+        "Publisher":  "Opera Software",
+        "InstallerSignatures":  {
+                                    "ProductName":  "Opera installer",
+                                    "CompanyName":  null,
+                                    "OriginalFilename":  "OperaGXSetup.exe",
+                                    "CertThumbprint":  "25F4C2A374C779AB087B79B7740216416CAF0EE0",
+                                    "SignerSimpleName":  "Opera Norway AS",
+                                    "FileDescriptions":  [
+                                                             "Opera installer SFX",
+                                                             "Opera GXSetup.exe"
+                                                         ]
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            "Opera GX",
+                            "Opera GX Stable",
+                            "Opera Software"
+                        ]
+    },
+    {
+        "Name":  "Opera Stable",
+        "UWPFamily":  null,
+        "ARPName":  "Opera Stable*",
+        "Publisher":  "Opera Software",
+        "InstallerSignatures":  {
+                                    "ProductName":  "Opera installer",
+                                    "CompanyName":  null,
+                                    "OriginalFilename":  "OperaSetup.exe",
+                                    "CertThumbprint":  "BF684995EFEA2306448FF2930367C60AC0F7172C",
+                                    "SignerSimpleName":  "Opera Norway AS",
+                                    "FileDescriptions":  [
+                                                             "Opera installer SFX",
+                                                             "Opera Setup.exe"
+                                                         ]
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            "Opera Software",
+                            "Opera Stable"
+                        ]
+    },
+    {
+        "Name":  "PPSSPP",
+        "UWPFamily":  null,
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  null,
+        "PortableExeSignatures":  {
+                                      "ProductName":  null,
+                                      "CompanyName":  null,
+                                      "OriginalFilename":  "ppsspp_win",
+                                      "CertThumbprint":  null,
+                                      "SignerSimpleName":  null,
+                                      "FileDescriptions":  "ppsspp_win"
+                                  },
+        "PathAnchors":  "ppsspp_win"
+    },
+    {
+        "Name":  "retroarch",
+        "UWPFamily":  null,
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  null,
+        "PortableExeSignatures":  {
+                                      "ProductName":  null,
+                                      "CompanyName":  null,
+                                      "OriginalFilename":  "RetroArch-MSVC10-Win64",
+                                      "CertThumbprint":  null,
+                                      "SignerSimpleName":  null,
+                                      "FileDescriptions":  "RetroArch-MSVC10-Win64"
+                                  },
+        "PathAnchors":  "RetroArch-MSVC10-Win64"
+    },
+    {
+        "Name":  "Riot Client",
+        "UWPFamily":  null,
+        "ARPName":  "Riot Client*",
+        "Publisher":  "Riot Games, Inc",
+        "InstallerSignatures":  {
+                                    "ProductName":  "RiotClient",
+                                    "CompanyName":  "Riot Games, Inc.",
+                                    "OriginalFilename":  "Install VALORANT.exe",
+                                    "CertThumbprint":  "7FEEA8A5B55F34023287495F77CE55B0887CAA05",
+                                    "SignerSimpleName":  "Riot Games",
+                                    "FileDescriptions":  [
+                                                             "Riot Client",
+                                                             "Riot",
+                                                             "Install VALORANT.exe"
+                                                         ]
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            "C:\\Riot Games\\Riot Client",
+                            "Riot",
+                            "Riot Client",
+                            "Riot Games",
+                            "Riot Games, Inc.",
+                            "RiotClient"
+                        ]
+    },
+    {
+        "Name":  "Roblox",
+        "UWPFamily":  "ROBLOXCORPORATION.ROBLOX_55nm5eh3cm0pr",
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  null,
+        "PortableExeSignatures":  null,
+        "PathAnchors":  "ROBLOXCORPORATION.ROBLOX_*"
+    },
+    {
+        "Name":  "Roblox Player",
+        "UWPFamily":  null,
+        "ARPName":  "Roblox Player*",
+        "Publisher":  "Roblox Corporation",
+        "InstallerSignatures":  {
+                                    "ProductName":  "Roblox Bootstrapper",
+                                    "CompanyName":  "Roblox Corporation",
+                                    "OriginalFilename":  "RobloxPlayerInstaller-JQGXMWMQ6Y.exe",
+                                    "CertThumbprint":  "813CA29445456DC3447C173347A0CE5B9494B24C",
+                                    "SignerSimpleName":  "Roblox Corporation",
+                                    "FileDescriptions":  "Roblox Roblox Player Installer-JQGXMWMQ6Y.exe"
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            "https_roblox.fandom.com_0.indexeddb.leveldb",
+                            "https_www.roblox.com_0.indexeddb.leveldb",
+                            "roblox",
+                            "Roblox Bootstrapper",
+                            "Roblox Corporation"
+                        ]
+    },
+    {
+        "Name":  "Roblox Studio",
+        "UWPFamily":  null,
+        "ARPName":  "Roblox Studio*",
+        "Publisher":  "Roblox Corporation",
+        "InstallerSignatures":  {
+                                    "ProductName":  "Roblox Bootstrapper",
+                                    "CompanyName":  "Roblox Corporation",
+                                    "OriginalFilename":  "RobloxPlayerInstaller-JQGXMWMQ6Y.exe",
+                                    "CertThumbprint":  "813CA29445456DC3447C173347A0CE5B9494B24C",
+                                    "SignerSimpleName":  "Roblox Corporation",
+                                    "FileDescriptions":  "Roblox Roblox Player Installer-JQGXMWMQ6Y.exe"
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            "Roblox",
+                            "Roblox Bootstrapper",
+                            "Roblox Corporation",
+                            "RobloxStudio",
+                            "roblox-studio"
+                        ]
+    },
+    {
+        "Name":  "Snapchat",
+        "UWPFamily":  "SnapInc.Snapchat_k1zn018256b8e",
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  null,
+        "PortableExeSignatures":  null,
+        "PathAnchors":  "SnapInc.Snapchat_*"
+    },
+    {
+        "Name":  "SNES",
+        "UWPFamily":  null,
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  {
+                                    "ProductName":  "Snes9x SNES Emulator",
+                                    "CompanyName":  "http://www.snes9x.com",
+                                    "OriginalFilename":  "Advanced_SNES_ROM_Utility.exe",
+                                    "CertThumbprint":  null,
+                                    "SignerSimpleName":  null,
+                                    "FileDescriptions":  [
+                                                             "Snes9x",
+                                                             "Advanced SNES ROM Utility",
+                                                             "Advanced_SNES_ROM_Utility.exe"
+                                                         ]
+                                },
+        "PortableExeSignatures":  {
+                                      "ProductName":  "Snes9x SNES Emulator",
+                                      "CompanyName":  "http://www.snes9x.com",
+                                      "OriginalFilename":  "Snes9x.exe",
+                                      "CertThumbprint":  null,
+                                      "SignerSimpleName":  null,
+                                      "FileDescriptions":  [
+                                                               "Snes9x",
+                                                               "Advanced SNES ROM Utility"
+                                                           ]
+                                  },
+        "PathAnchors":  [
+                            "SNES",
+                            "snes9x-1.62.3-win32-x64"
+                        ]
+    },
+    {
+        "Name":  "Stardew Valley",
+        "UWPFamily":  null,
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  {
+                                    "ProductName":  "Stardew Valley",
+                                    "CompanyName":  "ConcernedApe",
+                                    "OriginalFilename":  "Stardew Valley.dll",
+                                    "CertThumbprint":  null,
+                                    "SignerSimpleName":  null,
+                                    "FileDescriptions":  "Stardew Valley Stardew Valley.dll"
+                                },
+        "PortableExeSignatures":  {
+                                      "ProductName":  "Stardew Valley",
+                                      "CompanyName":  "ConcernedApe",
+                                      "OriginalFilename":  "Stardew Valley.dll",
+                                      "CertThumbprint":  null,
+                                      "SignerSimpleName":  null,
+                                      "FileDescriptions":  "Stardew Valley"
+                                  },
+        "PathAnchors":  [
+                            "Stardew Valley",
+                            "StardewValley"
+                        ]
+    },
+    {
+        "Name":  "TASEditor",
+        "UWPFamily":  null,
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  null,
+        "PortableExeSignatures":  {
+                                      "ProductName":  null,
+                                      "CompanyName":  null,
+                                      "OriginalFilename":  "taseditor",
+                                      "CertThumbprint":  null,
+                                      "SignerSimpleName":  null,
+                                      "FileDescriptions":  "taseditor"
+                                  },
+        "PathAnchors":  [
+                            "luaScripts",
+                            "taseditor"
+                        ]
+    },
+    {
+        "Name":  "TikTok",
+        "UWPFamily":  "BytedancePte.Ltd.TikTok_6yccndn6064se",
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  {
+                                    "ProductName":  "Store Installer",
+                                    "CompanyName":  "Microsoft Corporation",
+                                    "OriginalFilename":  "TikTok Installer.exe",
+                                    "CertThumbprint":  "CB603439DC30897FCED64CA353AA902DBD3540E3",
+                                    "SignerSimpleName":  "Microsoft Corporation",
+                                    "FileDescriptions":  "Store Installer Tik Tok Installer.exe"
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  "BytedancePte.Ltd.TikTok_*"
+    },
+    {
+        "Name":  "Tor Browser",
+        "UWPFamily":  null,
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  {
+                                    "ProductName":  "Tor Browser",
+                                    "CompanyName":  "Mozilla Foundation",
+                                    "OriginalFilename":  "tor-browser-windows-x86_64-portable-*.exe",
+                                    "CertThumbprint":  "4DEB8C027FFF4DD8DE3AE9BEFAA7898618ADCF15",
+                                    "SignerSimpleName":  "THE TOR PROJECT",
+                                    "FileDescriptions":  "Tor Browser Software Updatertor-browser-windows-x86_64-portable-*.exe"
+                                },
+        "PortableExeSignatures":  {
+                                      "ProductName":  "Tor Browser",
+                                      "CompanyName":  "Mozilla Foundation",
+                                      "OriginalFilename":  "updater.exe",
+                                      "CertThumbprint":  "4DEB8C027FFF4DD8DE3AE9BEFAA7898618ADCF15",
+                                      "SignerSimpleName":  "THE TOR PROJECT",
+                                      "FileDescriptions":  "Tor Browser Software Updater"
+                                  },
+        "PathAnchors":  "Tor Browser"
+    },
+    {
+        "Name":  "Visual Boy Advance",
+        "UWPFamily":  null,
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  {
+                                    "ProductName":  "VisualBoyAdvance-M",
+                                    "CompanyName":  "http://vba-m.com/",
+                                    "OriginalFilename":  "VisualBoyAdvance-M.exe",
+                                    "CertThumbprint":  "34025714D92839B99F89F8E80BBDDBCC465C7459",
+                                    "SignerSimpleName":  "Rafael Kitover",
+                                    "FileDescriptions":  "Visual Boy Advance-MVisual Boy Advance-M.exe"
+                                },
+        "PortableExeSignatures":  {
+                                      "ProductName":  "VisualBoyAdvance-M",
+                                      "CompanyName":  "http://vba-m.com/",
+                                      "OriginalFilename":  "VisualBoyAdvance-M.exe",
+                                      "CertThumbprint":  "34025714D92839B99F89F8E80BBDDBCC465C7459",
+                                      "SignerSimpleName":  "Rafael Kitover",
+                                      "FileDescriptions":  "Visual Boy Advance-M"
+                                  },
+        "PathAnchors":  [
+                            "Emus",
+                            "visualboyadvance-m",
+                            "visualboyadvance-m-Win-x86_64"
+                        ]
+    },
+    {
+        "Name":  "Wave Browser",
+        "UWPFamily":  null,
+        "ARPName":  "Wave Browser*",
+        "Publisher":  "Wavesor Software",
+        "InstallerSignatures":  {
+                                    "ProductName":  "WaveBrowser",
+                                    "CompanyName":  "Wavesor Software",
+                                    "OriginalFilename":  "Wave Browser.exe",
+                                    "CertThumbprint":  "2EA4ADE8719DE01274C5A3BAF694B91E339BDA79",
+                                    "SignerSimpleName":  "Wavesor Software (Eightpoint Technologies Ltd. SEZC)",
+                                    "FileDescriptions":  "Wave Browser Wave Browser.exe"
+                                },
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            "WaveBrowser",
+                            "Wavesor Software"
+                        ]
+    },
+    {
+        "Name":  "Wesnoth",
+        "UWPFamily":  "Wesnoth1.18",
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  {
+                                    "ProductName":  "The Battle for Wesnoth",
+                                    "CompanyName":  "The Battle for Wesnoth Project",
+                                    "OriginalFilename":  "wesnoth-*-win64.exe",
+                                    "CertThumbprint":  null,
+                                    "SignerSimpleName":  null,
+                                    "FileDescriptions":  [
+                                                             "Wesnoth Game Client",
+                                                             "Wesnoth Multiplayer Server",
+                                                             "wesnoth-*-win64.exe"
+                                                         ]
+                                },
+        "PortableExeSignatures":  {
+                                      "ProductName":  "The Battle for Wesnoth",
+                                      "CompanyName":  "The Battle for Wesnoth Project",
+                                      "OriginalFilename":  "wesnoth.exe",
+                                      "CertThumbprint":  null,
+                                      "SignerSimpleName":  null,
+                                      "FileDescriptions":  [
+                                                               "Wesnoth Game Client",
+                                                               "Wesnoth Multiplayer Server"
+                                                           ]
+                                  },
+        "PathAnchors":  [
+                            "battle-for-wesnoth-win-stable",
+                            "https_wesnoth.fandom.com_0.indexeddb.leveldb",
+                            "Wesnoth1.18"
+                        ]
+    },
+    {
+        "Name":  "XENIA-MASTER",
+        "UWPFamily":  null,
+        "ARPName":  null,
+        "Publisher":  null,
+        "InstallerSignatures":  null,
+        "PortableExeSignatures":  {
+                                      "ProductName":  null,
+                                      "CompanyName":  null,
+                                      "OriginalFilename":  "xenia_master",
+                                      "CertThumbprint":  null,
+                                      "SignerSimpleName":  null,
+                                      "FileDescriptions":  "xenia_master"
+                                  },
+        "PathAnchors":  [
+                            "xenia_master",
+                            "xenia-master"
+                        ]
+    }
+]
+'@
+
+function Ensure-Dir([string]$p) {
+  if (-not (Test-Path $p)) { New-Item -Path $p -ItemType Directory -Force | Out-Null }
+}
+
+function Write-FileUtf8([string]$path, [string]$content) {
+  $enc = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($path, $content, $enc)
+}
+
+function Set-RsdAclHard([string]$path) {
+  # Rebuild ACL from scratch (handles pre-existing permissive explicit ACEs).
+  # Target:
+  #   - SYSTEM: FullControl
+  #   - BUILTIN\Administrators: FullControl
+  #   - BUILTIN\Users: Read & Execute (optional)
+  #
+  # IMPORTANT:
+  # We intentionally DO NOT add explicit DENY entries because most admin accounts
+  # are also members of BUILTIN\Users; a DENY on Users would block admins too.
+  try {
+    if (-not (Test-Path $path)) { return }
+
+    # Take ownership to ensure we can rewrite DACL (best-effort).
+    try { takeown /F "$path" /A /R /D Y | Out-Null } catch {}
+
+    # 1) Disable inheritance (do not copy inherited ACEs)
+    icacls "$path" /inheritance:d | Out-Null
+
+    # 2) Remove broad allow/deny ACEs that could grant write access
+    foreach ($g in @('Everyone','Authenticated Users','Users','Domain Users')) {
+      try { icacls "$path" /remove:g "$g" | Out-Null } catch {}
+      try { icacls "$path" /remove:d "$g" | Out-Null } catch {}
+    }
+
+    # 3) Grant only what we want (replace any existing with /grant:r)
+    icacls "$path" /grant:r "NT AUTHORITY\SYSTEM:(OI)(CI)(F)" "BUILTIN\Administrators:(OI)(CI)(F)" | Out-Null
+
+    # Optional: allow standard users to read/execute (no write/delete). If you prefer them
+    # to have ZERO access, comment out the next line.
+    # icacls "$path" /grant:r "BUILTIN\Users:(OI)(CI)(RX)" | Out-Null
+
+    # 4) Apply recursively
+    icacls "$path" /T /C | Out-Null
+  } catch {
+    # Keep remediation resilient; Intune will re-run if needed.
+  }
+}
+
+
+function Set-RsdFileAcl([string]$path) {
+  try {
+    if (-not (Test-Path $path)) { return }
+    $acl = New-Object System.Security.AccessControl.FileSecurity
+    $inheritFlags = [System.Security.AccessControl.InheritanceFlags]::None
+    $propFlags    = [System.Security.AccessControl.PropagationFlags]::None
+    $typeAllow    = [System.Security.AccessControl.AccessControlType]::Allow
+
+    $ruleSystem = New-Object System.Security.AccessControl.FileSystemAccessRule("SYSTEM","FullControl",$inheritFlags,$propFlags,$typeAllow)
+    $ruleAdmins = New-Object System.Security.AccessControl.FileSystemAccessRule("Administrators","FullControl",$inheritFlags,$propFlags,$typeAllow)
+    $ruleUsers  = New-Object System.Security.AccessControl.FileSystemAccessRule("Users","ReadAndExecute",$inheritFlags,$propFlags,$typeAllow)
+
+    $acl.SetAccessRuleProtection($true,$false)
+    $acl.AddAccessRule($ruleSystem) | Out-Null
+    $acl.AddAccessRule($ruleAdmins) | Out-Null
+    $acl.AddAccessRule($ruleUsers)  | Out-Null
+
+    try {
+      $owner = New-Object System.Security.Principal.NTAccount("SYSTEM")
+      $acl.SetOwner($owner)
+    } catch {}
+
+    Set-Acl -LiteralPath $path -AclObject $acl -ErrorAction SilentlyContinue
+  } catch {}
+}
+
+function Register-CleanAgentTask {
+  $taskName = 'RSD Clean Agent'
+  $taskDesc = 'RSD local cleaning agent. Runs hourly; script enforces adaptive backoff schedule.'
+  $ps = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
+  $args = "-NoProfile -ExecutionPolicy Bypass -File `"$AgentScript`""
+
+  $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddHours(1)
+  $trigger.RepetitionInterval = (New-TimeSpan -Hours 1)
+  $trigger.RepetitionDuration = ([TimeSpan]::MaxValue)
+
+  $action = New-ScheduledTaskAction -Execute $ps -Argument $args
+  $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 20) -MultipleInstances IgnoreNew
+  $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+  $task = New-ScheduledTask -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description $taskDesc
+
+  try {
+    $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($existing) { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false | Out-Null }
+  } catch {}
+
+  try {
+    Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
+  } catch {
+    schtasks /Create /F /RU SYSTEM /RL HIGHEST /SC HOURLY /MO 1 /TN "$taskName" /TR "`"$ps`" $args" | Out-Null
+  }
+}
+
+Ensure-Dir $AgentRoot
+$RsdRoot = 'C:\ProgramData\RSD'
+Ensure-Dir $RsdRoot
+Ensure-Dir $LogDir
+
+Write-FileUtf8 $AgentScript $AgentPayload
+Write-FileUtf8 $TargetsPath $TargetsPayload
+Write-FileUtf8 $VersionFile $ThisVersion
+
+if (-not (Test-Path $StateFile)) {
+  $init = '{"phase":0,"phaseStart":"2026-02-27T20:42:10.010676","lastDetect":"2026-02-27T20:42:10.010681","lastRun":"2026-02-27T20:42:10.010682","lastFound":[]}'
+  Write-FileUtf8 $StateFile $init
+}
+
+Set-RsdAclHard $RsdRoot
+Set-RsdAclHard $AgentRoot
+Set-RsdFileAcl $AgentScript
+Set-RsdFileAcl $TargetsPath
+Set-RsdFileAcl $VersionFile
+Set-RsdFileAcl $StateFile
+
+Register-CleanAgentTask
+
+try { Start-ScheduledTask -TaskName 'RSD Clean Agent' -ErrorAction SilentlyContinue } catch {}
+
+exit 0
