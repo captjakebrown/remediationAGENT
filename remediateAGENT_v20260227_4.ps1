@@ -1,7 +1,7 @@
 <#
 RSD CleanAgent - Intune Proactive Remediation Remediation
 PowerShell 5.1 compatible
-Version: 2026.03.02.2
+Version: 2026.03.02.3
 
 Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
 #>
@@ -16,12 +16,12 @@ $VersionFile = Join-Path $AgentRoot 'version.txt'
 $StateFile   = Join-Path $AgentRoot 'state.json'
 $LogDir      = Join-Path $AgentRoot 'Logs'
 
-$ThisVersion = '2026.03.02.2'
+$ThisVersion = '2026.03.02.3'
 
 $AgentPayload = @'
 <#
 RSD CleanAgent (local) - PowerShell 5.1
-Version: 2026.03.02.2
+Version: 2026.03.02.3
 
 Behavior:
 - Batch inventory UWP/ARP once per run.
@@ -1590,9 +1590,15 @@ function Register-CleanAgentTask {
   $args = "-NoProfile -ExecutionPolicy Bypass -File `"$AgentScript`""
   $created = $false
 
-  # Always clear any stale task first (best effort)
-  try { schtasks /Delete /F /TN "$taskName" | Out-Null } catch {}
-  Remediate-Log ("Ensured old task is removed (if present): " + $taskName)
+  # If task already exists, keep it (avoid delete/recreate churn on repeated Intune runs).
+  try {
+    schtasks /Query /TN "$taskName" /FO LIST | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+      Remediate-Log ("Existing task already present: " + $taskName)
+      try { schtasks /Run /TN "$taskName" | Out-Null } catch {}
+      return $true
+    }
+  } catch {}
 
   $useScheduledTasksModule = $true
   foreach ($cmd in @('New-ScheduledTaskTrigger','New-ScheduledTaskAction','New-ScheduledTaskSettingsSet','New-ScheduledTaskPrincipal','New-ScheduledTask','Register-ScheduledTask')) {
@@ -1622,26 +1628,49 @@ function Register-CleanAgentTask {
 
   if (-not $created) {
     try {
+      $tr = "`"$ps`" -NoProfile -ExecutionPolicy Bypass -File `"$AgentScript`""
       Remediate-Log ("Creating scheduled task via schtasks: " + $taskName)
-      schtasks /Create /F /RU "SYSTEM" /RL HIGHEST /SC HOURLY /MO 1 /ST 00:00 /TN "$taskName" /TR "`"$ps`" $args" | Out-Null
-    } catch {}
+      schtasks /Create /F /RU "SYSTEM" /RL HIGHEST /SC HOURLY /MO 1 /TN "$taskName" /TR "$tr" | Out-Null
+    } catch {
+      Remediate-Log "schtasks.exe /Create threw an exception" 'ERROR'
+    }
   }
 
-  # Verification pass and immediate run
+  # Exact verification pass and immediate run
   try {
-    $query = schtasks /Query /TN "$taskName" /FO LIST 2>$null
-    if ($LASTEXITCODE -ne 0) {
-      $query = schtasks /Query /FO LIST /V 2>$null | Select-String -SimpleMatch $taskName
-    }
-    if ($query) {
+    schtasks /Query /TN "$taskName" /FO LIST | Out-Null
+    if ($LASTEXITCODE -eq 0) {
       Remediate-Log "Task present after registration: $taskName"
       try { schtasks /Run /TN "$taskName" | Out-Null } catch {}
       return $true
     }
+
+    $err = (schtasks /Query /TN "$taskName" /FO LIST 2>&1 | Out-String)
+    if ($err) { Remediate-Log ("Task query error: " + $err.Trim()) 'ERROR' }
   } catch {}
 
   Remediate-Log "Task registration verification failed: $taskName" 'ERROR'
   return $false
+}
+
+function Invoke-CleanAgentNow {
+  try {
+    if (-not (Test-Path $AgentScript)) { Remediate-Log "cleanAGENT script missing at runtime" 'ERROR'; return }
+    $ps = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $p = Start-Process -FilePath $ps -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$AgentScript`"" -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
+    if ($p) {
+      $done = $p.WaitForExit(600000)
+      if ($done) { Remediate-Log ("Immediate cleanAGENT run finished with exit code " + $p.ExitCode) }
+      else {
+        try { $p.Kill() } catch {}
+        Remediate-Log "Immediate cleanAGENT run timed out after 10 minutes" 'WARN'
+      }
+    } else {
+      Remediate-Log "Failed to start immediate cleanAGENT run process" 'ERROR'
+    }
+  } catch {
+    Remediate-Log "Immediate cleanAGENT run threw an exception" 'ERROR'
+  }
 }
 
 Ensure-Dir $AgentRoot
@@ -1674,5 +1703,6 @@ if (-not $taskOk) {
   exit 1
 }
 try { Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue } catch {}
+Invoke-CleanAgentNow
 Remediate-Log "Remediation deployment complete"
 exit 0
