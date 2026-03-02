@@ -1,7 +1,7 @@
 <#
 RSD CleanAgent - Intune Proactive Remediation Remediation
 PowerShell 5.1 compatible
-Version: 2026.03.02.3
+Version: 2026.03.02.4
 
 Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
 #>
@@ -16,12 +16,12 @@ $VersionFile = Join-Path $AgentRoot 'version.txt'
 $StateFile   = Join-Path $AgentRoot 'state.json'
 $LogDir      = Join-Path $AgentRoot 'Logs'
 
-$ThisVersion = '2026.03.02.3'
+$ThisVersion = '2026.03.02.4'
 
 $AgentPayload = @'
 <#
 RSD CleanAgent (local) - PowerShell 5.1
-Version: 2026.03.02.3
+Version: 2026.03.02.4
 
 Behavior:
 - Batch inventory UWP/ARP once per run.
@@ -438,8 +438,15 @@ try {
     return
   }
 
+  Log "Starting UWP snapshot (all users)"
+  $uwpStart = Get-Date
   $uwpSet = Snapshot-Uwp
+  Log (("Completed UWP snapshot. Package families indexed={0} elapsedSec={1}" -f $uwpSet.Count, [int](New-TimeSpan -Start $uwpStart -End (Get-Date)).TotalSeconds))
+
+  Log "Starting ARP snapshot"
+  $arpStart = Get-Date
   $arpList = Snapshot-Arp
+  Log (("Completed ARP snapshot. Entries indexed={0} elapsedSec={1}" -f $arpList.Count, [int](New-TimeSpan -Start $arpStart -End (Get-Date)).TotalSeconds))
 
   $foundThisRun = @()
   $removedThisRun = @()
@@ -473,8 +480,15 @@ try {
   }
 
   # Refresh & residual filesystem pass (portable/installer artifacts)
+  Log "Starting post-removal UWP snapshot"
+  $uwp2Start = Get-Date
   $uwpSet2 = Snapshot-Uwp
+  Log (("Completed post-removal UWP snapshot. Package families indexed={0} elapsedSec={1}" -f $uwpSet2.Count, [int](New-TimeSpan -Start $uwp2Start -End (Get-Date)).TotalSeconds))
+
+  Log "Starting post-removal ARP snapshot"
+  $arp2Start = Get-Date
   $arpList2 = Snapshot-Arp
+  Log (("Completed post-removal ARP snapshot. Entries indexed={0} elapsedSec={1}" -f $arpList2.Count, [int](New-TimeSpan -Start $arp2Start -End (Get-Date)).TotalSeconds))
 
   $residual = @()
   foreach ($t in $targets) {
@@ -490,8 +504,11 @@ try {
   $roots = $roots | Where-Object { $_ } | Select-Object -Unique
 
   Log ("Index roots: " + ($roots -join '; '))
+  Log "Starting filesystem index pass"
+  $idxStart = Get-Date
 
   $fileIndex = Index-Files $roots 2
+  Log (("Completed filesystem index pass. Indexed file keys={0} elapsedSec={1}" -f $fileIndex.Keys.Count, [int](New-TimeSpan -Start $idxStart -End (Get-Date)).TotalSeconds))
 
   $portableVerifiedGone = $true
   $foundAnyArtifacts = $false
@@ -1475,6 +1492,18 @@ $TargetsPayload = @'
                             "battle-for-wesnoth-win-stable",
                             "https_wesnoth.fandom.com_0.indexeddb.leveldb",
                             "Wesnoth1.18"
+                        ]
+    },
+    {
+        "Name":  "Xbox App",
+        "UWPFamily":  "Microsoft.GamingApp_8wekyb3d8bbwe",
+        "ARPName":  null,
+        "Publisher":  "Microsoft Corporation",
+        "InstallerSignatures":  null,
+        "PortableExeSignatures":  null,
+        "PathAnchors":  [
+                            "Microsoft.GamingApp_8wekyb3d8bbwe",
+                            "GamingApp"
                         ]
     },
     {
