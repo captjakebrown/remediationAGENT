@@ -9,6 +9,10 @@ Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'SilentlyContinue'
 
+param(
+  [string]$RunSource
+)
+
 $AgentRoot = 'C:\ProgramData\RSD\Agent'
 $AgentScript = Join-Path $AgentRoot 'cleanAGENT.ps1'
 $TargetsPath = Join-Path $AgentRoot 'targets.json'
@@ -424,6 +428,10 @@ try {
     return
   }
 
+  if ($RunSource) {
+    Log ("Run source marker: " + $RunSource)
+  }
+
   $activeUser = Get-ActiveUser
   Log ("Active user: " + $activeUser)
   Disable-OneDriveDeletePrompt $activeUser
@@ -453,28 +461,26 @@ try {
 
   # Pass 1: remove UWP + quiet ARP
   Log "Starting Pass 1"
-  try {
-    foreach ($t in $targets) {
-      $present = $false
-      if ($t.UWPFamily -and $uwpSet.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $present = $true; $foundThisRun += $t.Name }
-      if (-not $present -and $t.ARPName) {
-        if ((Match-Arp $arpList $t.ARPName).Count -gt 0) { $present = $true; $foundThisRun += $t.Name }
-      }
-      if (-not $present) { continue }
+  foreach ($t in $targets) {
+    $present = $false
+    if ($t.UWPFamily -and $uwpSet.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $present = $true; $foundThisRun += $t.Name }
+    if (-not $present -and $t.ARPName) {
+      if ((Match-Arp $arpList $t.ARPName).Count -gt 0) { $present = $true; $foundThisRun += $t.Name }
+    }
+    if (-not $present) { continue }
 
-      $did = $false
-      if ($t.UWPFamily) { $did = (Remove-UwpFamily $t.UWPFamily) -or $did }
+    $did = $false
+    if ($t.UWPFamily) { $did = (Remove-UwpFamily $t.UWPFamily) -or $did }
 
-      if ($t.ARPName) {
-        $matches = Match-Arp $arpList $t.ARPName
-        foreach ($e in $matches) {
-          if ($e.QuietUninstallString) {
-            Log ("Quiet uninstall ARP: " + $e.DisplayName)
-            $ok = Invoke-QuietUninstall $e.QuietUninstallString
-            if ($ok) { $did = $true } else { Log ("Quiet uninstall failed: " + $e.DisplayName) "WARN" }
-          } else {
-            Log ("No QuietUninstallString for: " + $e.DisplayName) "WARN"
-          }
+    if ($t.ARPName) {
+      $matches = Match-Arp $arpList $t.ARPName
+      foreach ($e in $matches) {
+        if ($e.QuietUninstallString) {
+          Log ("Quiet uninstall ARP: " + $e.DisplayName)
+          $ok = Invoke-QuietUninstall $e.QuietUninstallString
+          if ($ok) { $did = $true } else { Log ("Quiet uninstall failed: " + $e.DisplayName) "WARN" }
+        } else {
+          Log ("No QuietUninstallString for: " + $e.DisplayName) "WARN"
         }
       }
 
@@ -563,6 +569,10 @@ try {
     $scriptExitCode = 1
   }
 }
+catch {
+  Log ("Caught exception: " + $_.Exception.Message) 'ERROR'
+  $scriptExitCode = 1
+}
 finally {
   if ($mutexOwned -and $mutex) {
     try { $mutex.ReleaseMutex() | Out-Null } catch {}
@@ -570,6 +580,7 @@ finally {
   if ($mutex) {
     try { $mutex.Dispose() } catch {}
   }
+  Log ("Run completed with exit code " + $scriptExitCode)
 }
 
 exit $scriptExitCode
@@ -1793,15 +1804,41 @@ function Register-CleanAgentTask {
 
 function Invoke-CleanAgentNow {
   try {
-    if (-not (Test-Path $AgentScript)) { Remediate-Log -m "cleanAGENT script missing at runtime" -lvl 'ERROR'; return }
+    if (-not (Test-Path $AgentScript)) { Remediate-Log "cleanAGENT script missing at runtime" 'ERROR'; return }
+    $immediateMarkerPath = Join-Path $LogDir 'cleanAGENT_immediate_start.txt'
+    try {
+      Set-Content -Path $immediateMarkerPath -Value ((Get-Date).ToString('o')) -Encoding UTF8
+    } catch {
+      Remediate-Log ("Failed to write immediate start marker at " + $immediateMarkerPath) 'WARN'
+    }
+
     $ps = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
-    $p = Start-Process -FilePath $ps -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$AgentScript`"" -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
+    $p = Start-Process -FilePath $ps -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$AgentScript`" -RunSource Immediate" -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
     if ($p) {
       $done = $p.WaitForExit(600000)
       if ($done) { Remediate-Log ("Immediate cleanAGENT run finished with exit code " + $p.ExitCode) }
       else {
         try { $p.Kill() } catch {}
         Remediate-Log -m "Immediate cleanAGENT run timed out after 10 minutes" -lvl 'WARN'
+      }
+
+      $latestCleanLog = $null
+      try {
+        $latestCleanLog = Get-ChildItem -Path $LogDir -Filter 'cleanAGENT_*.log' -File -ErrorAction SilentlyContinue |
+          Sort-Object LastWriteTime -Descending |
+          Select-Object -First 1
+      } catch {}
+
+      if (-not $latestCleanLog) {
+        Remediate-Log "Remediation validation failed: no cleanAGENT_*.log found after immediate run" 'ERROR'
+      } else {
+        $logText = ''
+        try { $logText = Get-Content -Raw -Path $latestCleanLog.FullName -Encoding UTF8 } catch {}
+        $hasPass1 = ($logText -match 'Starting Pass 1')
+        $hasResidualOrException = (($logText -match 'Completed Residual Pass') -or ($logText -match 'Caught exception:'))
+        if (-not ($hasPass1 -and $hasResidualOrException)) {
+          Remediate-Log ("Remediation validation failed for " + $latestCleanLog.Name + ": missing required completion markers") 'ERROR'
+        }
       }
     } else {
       Remediate-Log -m "Failed to start immediate cleanAGENT run process" -lvl 'ERROR'
