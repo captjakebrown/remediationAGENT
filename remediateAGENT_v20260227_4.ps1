@@ -452,83 +452,98 @@ try {
   $removedThisRun = @()
 
   # Pass 1: remove UWP + quiet ARP
-  foreach ($t in $targets) {
-    $present = $false
-    if ($t.UWPFamily -and $uwpSet.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $present = $true; $foundThisRun += $t.Name }
-    if (-not $present -and $t.ARPName) {
-      if ((Match-Arp $arpList $t.ARPName).Count -gt 0) { $present = $true; $foundThisRun += $t.Name }
-    }
-    if (-not $present) { continue }
+  Log "Starting Pass 1"
+  try {
+    foreach ($t in $targets) {
+      $present = $false
+      if ($t.UWPFamily -and $uwpSet.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $present = $true; $foundThisRun += $t.Name }
+      if (-not $present -and $t.ARPName) {
+        if ((Match-Arp $arpList $t.ARPName).Count -gt 0) { $present = $true; $foundThisRun += $t.Name }
+      }
+      if (-not $present) { continue }
 
-    $did = $false
-    if ($t.UWPFamily) { $did = (Remove-UwpFamily $t.UWPFamily) -or $did }
+      $did = $false
+      if ($t.UWPFamily) { $did = (Remove-UwpFamily $t.UWPFamily) -or $did }
 
-    if ($t.ARPName) {
-      $matches = Match-Arp $arpList $t.ARPName
-      foreach ($e in $matches) {
-        if ($e.QuietUninstallString) {
-          Log ("Quiet uninstall ARP: " + $e.DisplayName)
-          $ok = Invoke-QuietUninstall $e.QuietUninstallString
-          if ($ok) { $did = $true } else { Log ("Quiet uninstall failed: " + $e.DisplayName) "WARN" }
-        } else {
-          Log ("No QuietUninstallString for: " + $e.DisplayName) "WARN"
+      if ($t.ARPName) {
+        $matches = Match-Arp $arpList $t.ARPName
+        foreach ($e in $matches) {
+          if ($e.QuietUninstallString) {
+            Log ("Quiet uninstall ARP: " + $e.DisplayName)
+            $ok = Invoke-QuietUninstall $e.QuietUninstallString
+            if ($ok) { $did = $true } else { Log ("Quiet uninstall failed: " + $e.DisplayName) "WARN" }
+          } else {
+            Log ("No QuietUninstallString for: " + $e.DisplayName) "WARN"
+          }
         }
       }
-    }
 
-    if ($did) { $removedThisRun += $t.Name }
+      if ($did) { $removedThisRun += $t.Name }
+    }
+  } catch {
+    $line = if ($_.InvocationInfo -and $_.InvocationInfo.ScriptLineNumber) { $_.InvocationInfo.ScriptLineNumber } else { "unknown" }
+    Log ("Stage failure [Pass 1]: message='" + $_.Exception.Message + "' line=" + $line) "ERROR"
+    $scriptExitCode = 1
   }
+  Log "Completed Pass 1"
 
   # Refresh & residual filesystem pass (portable/installer artifacts)
-  Log "Starting post-removal UWP snapshot"
-  $uwp2Start = Get-Date
-  $uwpSet2 = Snapshot-Uwp
-  Log (("Completed post-removal UWP snapshot. Package families indexed={0} elapsedSec={1}" -f $uwpSet2.Count, [int](New-TimeSpan -Start $uwp2Start -End (Get-Date)).TotalSeconds))
-
-  Log "Starting post-removal ARP snapshot"
-  $arp2Start = Get-Date
-  $arpList2 = Snapshot-Arp
-  Log (("Completed post-removal ARP snapshot. Entries indexed={0} elapsedSec={1}" -f $arpList2.Count, [int](New-TimeSpan -Start $arp2Start -End (Get-Date)).TotalSeconds))
-
-  $residual = @()
-  foreach ($t in $targets) {
-    $still = $false
-    if ($t.UWPFamily -and $uwpSet2.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $still = $true }
-    if (-not $still -and $t.ARPName) { if ((Match-Arp $arpList2 $t.ARPName).Count -gt 0) { $still = $true } }
-    if ($still -or $t.PortableExeSignatures -or $t.InstallerSignatures) { $residual += $t }
-  }
-
-  $roots = @()
-  if ($activeUser) { $roots += (Get-PresenceZonesForUser $activeUser) }
-  $roots += (Get-ShallowCDrives)
-  $roots = $roots | Where-Object { $_ } | Select-Object -Unique
-
-  Log ("Index roots: " + ($roots -join '; '))
-  Log "Starting filesystem index pass"
-  $idxStart = Get-Date
-
-  $fileIndex = Index-Files $roots 2
-  Log (("Completed filesystem index pass. Indexed file keys={0} elapsedSec={1}" -f $fileIndex.Keys.Count, [int](New-TimeSpan -Start $idxStart -End (Get-Date)).TotalSeconds))
-
+  Log "Starting Residual Pass"
   $portableVerifiedGone = $true
   $foundAnyArtifacts = $false
+  try {
+    Log "Starting post-removal UWP snapshot"
+    $uwp2Start = Get-Date
+    $uwpSet2 = Snapshot-Uwp
+    Log (("Completed post-removal UWP snapshot. Package families indexed={0} elapsedSec={1}" -f $uwpSet2.Count, [int](New-TimeSpan -Start $uwp2Start -End (Get-Date)).TotalSeconds))
 
-  foreach ($t in $residual) {
-    $stems = Build-Stems $t
-    if (-not $stems -or $stems.Count -eq 0) { continue }
-    if ($activeUser) {
-      $shortcutRemoved = Remove-QuickLaunchMatches $activeUser $stems
-      if ($shortcutRemoved) { $removedThisRun += $t.Name }
+    Log "Starting post-removal ARP snapshot"
+    $arp2Start = Get-Date
+    $arpList2 = Snapshot-Arp
+    Log (("Completed post-removal ARP snapshot. Entries indexed={0} elapsedSec={1}" -f $arpList2.Count, [int](New-TimeSpan -Start $arp2Start -End (Get-Date)).TotalSeconds))
+
+    $residual = @()
+    foreach ($t in $targets) {
+      $still = $false
+      if ($t.UWPFamily -and $uwpSet2.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $still = $true }
+      if (-not $still -and $t.ARPName) { if ((Match-Arp $arpList2 $t.ARPName).Count -gt 0) { $still = $true } }
+      if ($still -or $t.PortableExeSignatures -or $t.InstallerSignatures) { $residual += $t }
     }
-    $hits = Find-MatchingFiles $fileIndex $stems
-    if ($hits.Count -gt 0) {
-      $foundAnyArtifacts = $true
-      Log ("Removing artifacts for " + $t.Name + " hits=" + $hits.Count)
-      Remove-Paths $hits
-      $removedThisRun += $t.Name
-      foreach ($p in $hits) { if (Test-Path $p) { $portableVerifiedGone = $false } }
+
+    $roots = @()
+    if ($activeUser) { $roots += (Get-PresenceZonesForUser $activeUser) }
+    $roots += (Get-ShallowCDrives)
+    $roots = $roots | Where-Object { $_ } | Select-Object -Unique
+
+    Log ("Index roots: " + ($roots -join '; '))
+    Log "Starting filesystem index pass"
+    $idxStart = Get-Date
+
+    $fileIndex = Index-Files $roots 2
+    Log (("Completed filesystem index pass. Indexed file keys={0} elapsedSec={1}" -f $fileIndex.Keys.Count, [int](New-TimeSpan -Start $idxStart -End (Get-Date)).TotalSeconds))
+
+    foreach ($t in $residual) {
+      $stems = Build-Stems $t
+      if (-not $stems -or $stems.Count -eq 0) { continue }
+      if ($activeUser) {
+        $shortcutRemoved = Remove-QuickLaunchMatches $activeUser $stems
+        if ($shortcutRemoved) { $removedThisRun += $t.Name }
+      }
+      $hits = Find-MatchingFiles $fileIndex $stems
+      if ($hits.Count -gt 0) {
+        $foundAnyArtifacts = $true
+        Log ("Removing artifacts for " + $t.Name + " hits=" + $hits.Count)
+        Remove-Paths $hits
+        $removedThisRun += $t.Name
+        foreach ($p in $hits) { if (Test-Path $p) { $portableVerifiedGone = $false } }
+      }
     }
+  } catch {
+    $line = if ($_.InvocationInfo -and $_.InvocationInfo.ScriptLineNumber) { $_.InvocationInfo.ScriptLineNumber } else { "unknown" }
+    Log ("Stage failure [Residual Pass]: message='" + $_.Exception.Message + "' line=" + $line) "ERROR"
+    $scriptExitCode = 1
   }
+  Log "Completed Residual Pass"
 
   $foundAny = ($foundThisRun | Select-Object -Unique)
   if ($foundAny.Count -gt 0 -or $foundAnyArtifacts) {
