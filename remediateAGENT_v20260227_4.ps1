@@ -87,7 +87,7 @@ function Invoke-RegLoadWithTimeout([string]$hiveName, [string]$ntUserDat, [int]$
     if (-not $p) { return $false }
     if (-not $p.WaitForExit($timeoutMs)) {
       try { $p.Kill() } catch {}
-      Remediate-Log ("reg load timeout for hive " + $hiveName) 'WARN'
+      Remediate-Log -m ("reg load timeout for hive " + $hiveName) -lvl 'WARN'
       return $false
     }
     return ($p.ExitCode -eq 0)
@@ -432,7 +432,7 @@ try {
   $targets = Get-Targets
   Log ("Target count loaded: " + $targets.Count)
   if (-not $targets -or $targets.Count -eq 0) {
-    Log "targets.json missing/empty." "WARN"
+    Log -m "targets.json missing/empty." -lvl "WARN"
     $state.lastRun = (Get-Date).ToString('o')
     Write-JsonFile $StateFile $state
     return
@@ -452,83 +452,98 @@ try {
   $removedThisRun = @()
 
   # Pass 1: remove UWP + quiet ARP
-  foreach ($t in $targets) {
-    $present = $false
-    if ($t.UWPFamily -and $uwpSet.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $present = $true; $foundThisRun += $t.Name }
-    if (-not $present -and $t.ARPName) {
-      if ((Match-Arp $arpList $t.ARPName).Count -gt 0) { $present = $true; $foundThisRun += $t.Name }
-    }
-    if (-not $present) { continue }
+  Log "Starting Pass 1"
+  try {
+    foreach ($t in $targets) {
+      $present = $false
+      if ($t.UWPFamily -and $uwpSet.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $present = $true; $foundThisRun += $t.Name }
+      if (-not $present -and $t.ARPName) {
+        if ((Match-Arp $arpList $t.ARPName).Count -gt 0) { $present = $true; $foundThisRun += $t.Name }
+      }
+      if (-not $present) { continue }
 
-    $did = $false
-    if ($t.UWPFamily) { $did = (Remove-UwpFamily $t.UWPFamily) -or $did }
+      $did = $false
+      if ($t.UWPFamily) { $did = (Remove-UwpFamily $t.UWPFamily) -or $did }
 
-    if ($t.ARPName) {
-      $matches = Match-Arp $arpList $t.ARPName
-      foreach ($e in $matches) {
-        if ($e.QuietUninstallString) {
-          Log ("Quiet uninstall ARP: " + $e.DisplayName)
-          $ok = Invoke-QuietUninstall $e.QuietUninstallString
-          if ($ok) { $did = $true } else { Log ("Quiet uninstall failed: " + $e.DisplayName) "WARN" }
-        } else {
-          Log ("No QuietUninstallString for: " + $e.DisplayName) "WARN"
+      if ($t.ARPName) {
+        $matches = Match-Arp $arpList $t.ARPName
+        foreach ($e in $matches) {
+          if ($e.QuietUninstallString) {
+            Log ("Quiet uninstall ARP: " + $e.DisplayName)
+            $ok = Invoke-QuietUninstall $e.QuietUninstallString
+            if ($ok) { $did = $true } else { Log ("Quiet uninstall failed: " + $e.DisplayName) "WARN" }
+          } else {
+            Log ("No QuietUninstallString for: " + $e.DisplayName) "WARN"
+          }
         }
       }
-    }
 
-    if ($did) { $removedThisRun += $t.Name }
+      if ($did) { $removedThisRun += $t.Name }
+    }
+  } catch {
+    $line = if ($_.InvocationInfo -and $_.InvocationInfo.ScriptLineNumber) { $_.InvocationInfo.ScriptLineNumber } else { "unknown" }
+    Log ("Stage failure [Pass 1]: message='" + $_.Exception.Message + "' line=" + $line) "ERROR"
+    $scriptExitCode = 1
   }
+  Log "Completed Pass 1"
 
   # Refresh & residual filesystem pass (portable/installer artifacts)
-  Log "Starting post-removal UWP snapshot"
-  $uwp2Start = Get-Date
-  $uwpSet2 = Snapshot-Uwp
-  Log (("Completed post-removal UWP snapshot. Package families indexed={0} elapsedSec={1}" -f $uwpSet2.Count, [int](New-TimeSpan -Start $uwp2Start -End (Get-Date)).TotalSeconds))
-
-  Log "Starting post-removal ARP snapshot"
-  $arp2Start = Get-Date
-  $arpList2 = Snapshot-Arp
-  Log (("Completed post-removal ARP snapshot. Entries indexed={0} elapsedSec={1}" -f $arpList2.Count, [int](New-TimeSpan -Start $arp2Start -End (Get-Date)).TotalSeconds))
-
-  $residual = @()
-  foreach ($t in $targets) {
-    $still = $false
-    if ($t.UWPFamily -and $uwpSet2.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $still = $true }
-    if (-not $still -and $t.ARPName) { if ((Match-Arp $arpList2 $t.ARPName).Count -gt 0) { $still = $true } }
-    if ($still -or $t.PortableExeSignatures -or $t.InstallerSignatures) { $residual += $t }
-  }
-
-  $roots = @()
-  if ($activeUser) { $roots += (Get-PresenceZonesForUser $activeUser) }
-  $roots += (Get-ShallowCDrives)
-  $roots = $roots | Where-Object { $_ } | Select-Object -Unique
-
-  Log ("Index roots: " + ($roots -join '; '))
-  Log "Starting filesystem index pass"
-  $idxStart = Get-Date
-
-  $fileIndex = Index-Files $roots 2
-  Log (("Completed filesystem index pass. Indexed file keys={0} elapsedSec={1}" -f $fileIndex.Keys.Count, [int](New-TimeSpan -Start $idxStart -End (Get-Date)).TotalSeconds))
-
+  Log "Starting Residual Pass"
   $portableVerifiedGone = $true
   $foundAnyArtifacts = $false
+  try {
+    Log "Starting post-removal UWP snapshot"
+    $uwp2Start = Get-Date
+    $uwpSet2 = Snapshot-Uwp
+    Log (("Completed post-removal UWP snapshot. Package families indexed={0} elapsedSec={1}" -f $uwpSet2.Count, [int](New-TimeSpan -Start $uwp2Start -End (Get-Date)).TotalSeconds))
 
-  foreach ($t in $residual) {
-    $stems = Build-Stems $t
-    if (-not $stems -or $stems.Count -eq 0) { continue }
-    if ($activeUser) {
-      $shortcutRemoved = Remove-QuickLaunchMatches $activeUser $stems
-      if ($shortcutRemoved) { $removedThisRun += $t.Name }
+    Log "Starting post-removal ARP snapshot"
+    $arp2Start = Get-Date
+    $arpList2 = Snapshot-Arp
+    Log (("Completed post-removal ARP snapshot. Entries indexed={0} elapsedSec={1}" -f $arpList2.Count, [int](New-TimeSpan -Start $arp2Start -End (Get-Date)).TotalSeconds))
+
+    $residual = @()
+    foreach ($t in $targets) {
+      $still = $false
+      if ($t.UWPFamily -and $uwpSet2.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $still = $true }
+      if (-not $still -and $t.ARPName) { if ((Match-Arp $arpList2 $t.ARPName).Count -gt 0) { $still = $true } }
+      if ($still -or $t.PortableExeSignatures -or $t.InstallerSignatures) { $residual += $t }
     }
-    $hits = Find-MatchingFiles $fileIndex $stems
-    if ($hits.Count -gt 0) {
-      $foundAnyArtifacts = $true
-      Log ("Removing artifacts for " + $t.Name + " hits=" + $hits.Count)
-      Remove-Paths $hits
-      $removedThisRun += $t.Name
-      foreach ($p in $hits) { if (Test-Path $p) { $portableVerifiedGone = $false } }
+
+    $roots = @()
+    if ($activeUser) { $roots += (Get-PresenceZonesForUser $activeUser) }
+    $roots += (Get-ShallowCDrives)
+    $roots = $roots | Where-Object { $_ } | Select-Object -Unique
+
+    Log ("Index roots: " + ($roots -join '; '))
+    Log "Starting filesystem index pass"
+    $idxStart = Get-Date
+
+    $fileIndex = Index-Files $roots 2
+    Log (("Completed filesystem index pass. Indexed file keys={0} elapsedSec={1}" -f $fileIndex.Keys.Count, [int](New-TimeSpan -Start $idxStart -End (Get-Date)).TotalSeconds))
+
+    foreach ($t in $residual) {
+      $stems = Build-Stems $t
+      if (-not $stems -or $stems.Count -eq 0) { continue }
+      if ($activeUser) {
+        $shortcutRemoved = Remove-QuickLaunchMatches $activeUser $stems
+        if ($shortcutRemoved) { $removedThisRun += $t.Name }
+      }
+      $hits = Find-MatchingFiles $fileIndex $stems
+      if ($hits.Count -gt 0) {
+        $foundAnyArtifacts = $true
+        Log ("Removing artifacts for " + $t.Name + " hits=" + $hits.Count)
+        Remove-Paths $hits
+        $removedThisRun += $t.Name
+        foreach ($p in $hits) { if (Test-Path $p) { $portableVerifiedGone = $false } }
+      }
     }
+  } catch {
+    $line = if ($_.InvocationInfo -and $_.InvocationInfo.ScriptLineNumber) { $_.InvocationInfo.ScriptLineNumber } else { "unknown" }
+    Log ("Stage failure [Residual Pass]: message='" + $_.Exception.Message + "' line=" + $line) "ERROR"
+    $scriptExitCode = 1
   }
+  Log "Completed Residual Pass"
 
   $foundAny = ($foundThisRun | Select-Object -Unique)
   if ($foundAny.Count -gt 0 -or $foundAnyArtifacts) {
@@ -544,7 +559,7 @@ try {
   Write-JsonFile $StateFile $state
 
   if (-not $portableVerifiedGone) {
-    Log "Portable verification failed (some artifacts remain)." "WARN"
+    Log -m "Portable verification failed (some artifacts remain)." -lvl "WARN"
     $scriptExitCode = 1
   }
 }
@@ -1742,10 +1757,10 @@ function Register-CleanAgentTask {
       $created = $true
       Remediate-Log "Registered task via ScheduledTasks module"
     } catch {
-      Remediate-Log "ScheduledTasks registration failed; falling back to schtasks.exe" 'WARN'
+      Remediate-Log -m "ScheduledTasks registration failed; falling back to schtasks.exe" -lvl 'WARN'
     }
   } else {
-    Remediate-Log "ScheduledTasks cmdlets unavailable; using schtasks.exe fallback" 'WARN'
+    Remediate-Log -m "ScheduledTasks cmdlets unavailable; using schtasks.exe fallback" -lvl 'WARN'
   }
 
   if (-not $created) {
@@ -1754,7 +1769,7 @@ function Register-CleanAgentTask {
       Remediate-Log ("Creating scheduled task via schtasks: " + $fullTaskName)
       schtasks /Create /F /RU "SYSTEM" /RL HIGHEST /SC HOURLY /MO 1 /TN "$fullTaskName" /TR "$tr" | Out-Null
     } catch {
-      Remediate-Log "schtasks.exe /Create threw an exception" 'ERROR'
+      Remediate-Log -m "schtasks.exe /Create threw an exception" -lvl 'ERROR'
     }
   }
 
@@ -1778,7 +1793,7 @@ function Register-CleanAgentTask {
 
 function Invoke-CleanAgentNow {
   try {
-    if (-not (Test-Path $AgentScript)) { Remediate-Log "cleanAGENT script missing at runtime" 'ERROR'; return }
+    if (-not (Test-Path $AgentScript)) { Remediate-Log -m "cleanAGENT script missing at runtime" -lvl 'ERROR'; return }
     $ps = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
     $p = Start-Process -FilePath $ps -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$AgentScript`"" -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
     if ($p) {
@@ -1786,13 +1801,13 @@ function Invoke-CleanAgentNow {
       if ($done) { Remediate-Log ("Immediate cleanAGENT run finished with exit code " + $p.ExitCode) }
       else {
         try { $p.Kill() } catch {}
-        Remediate-Log "Immediate cleanAGENT run timed out after 10 minutes" 'WARN'
+        Remediate-Log -m "Immediate cleanAGENT run timed out after 10 minutes" -lvl 'WARN'
       }
     } else {
-      Remediate-Log "Failed to start immediate cleanAGENT run process" 'ERROR'
+      Remediate-Log -m "Failed to start immediate cleanAGENT run process" -lvl 'ERROR'
     }
   } catch {
-    Remediate-Log "Immediate cleanAGENT run threw an exception" 'ERROR'
+    Remediate-Log -m "Immediate cleanAGENT run threw an exception" -lvl 'ERROR'
   }
 }
 
@@ -1823,7 +1838,7 @@ $taskName = "RSD-CleanAGENT"
 $taskPath = "\\RSD\\"
 $taskOk = Register-CleanAgentTask
 if (-not $taskOk) {
-  Remediate-Log "Remediation deployment completed with task registration failure" "ERROR"
+  Remediate-Log -m "Remediation deployment completed with task registration failure" -lvl "ERROR"
   exit 1
 }
 try { Start-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction SilentlyContinue } catch {}
