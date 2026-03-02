@@ -91,7 +91,7 @@ function Invoke-RegLoadWithTimeout([string]$hiveName, [string]$ntUserDat, [int]$
     if (-not $p) { return $false }
     if (-not $p.WaitForExit($timeoutMs)) {
       try { $p.Kill() } catch {}
-      Remediate-Log ("reg load timeout for hive " + $hiveName) 'WARN'
+      Remediate-Log -m ("reg load timeout for hive " + $hiveName) -lvl 'WARN'
       return $false
     }
     return ($p.ExitCode -eq 0)
@@ -440,7 +440,7 @@ try {
   $targets = Get-Targets
   Log ("Target count loaded: " + $targets.Count)
   if (-not $targets -or $targets.Count -eq 0) {
-    Log "targets.json missing/empty." "WARN"
+    Log -m "targets.json missing/empty." -lvl "WARN"
     $state.lastRun = (Get-Date).ToString('o')
     Write-JsonFile $StateFile $state
     return
@@ -483,60 +483,71 @@ try {
           Log ("No QuietUninstallString for: " + $e.DisplayName) "WARN"
         }
       }
-    }
 
-    if ($did) { $removedThisRun += $t.Name }
+      if ($did) { $removedThisRun += $t.Name }
+    }
+  } catch {
+    $line = if ($_.InvocationInfo -and $_.InvocationInfo.ScriptLineNumber) { $_.InvocationInfo.ScriptLineNumber } else { "unknown" }
+    Log ("Stage failure [Pass 1]: message='" + $_.Exception.Message + "' line=" + $line) "ERROR"
+    $scriptExitCode = 1
   }
+  Log "Completed Pass 1"
 
   # Refresh & residual filesystem pass (portable/installer artifacts)
-  Log "Starting post-removal UWP snapshot"
-  $uwp2Start = Get-Date
-  $uwpSet2 = Snapshot-Uwp
-  Log (("Completed post-removal UWP snapshot. Package families indexed={0} elapsedSec={1}" -f $uwpSet2.Count, [int](New-TimeSpan -Start $uwp2Start -End (Get-Date)).TotalSeconds))
-
-  Log "Starting post-removal ARP snapshot"
-  $arp2Start = Get-Date
-  $arpList2 = Snapshot-Arp
-  Log (("Completed post-removal ARP snapshot. Entries indexed={0} elapsedSec={1}" -f $arpList2.Count, [int](New-TimeSpan -Start $arp2Start -End (Get-Date)).TotalSeconds))
-
-  $residual = @()
-  foreach ($t in $targets) {
-    $still = $false
-    if ($t.UWPFamily -and $uwpSet2.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $still = $true }
-    if (-not $still -and $t.ARPName) { if ((Match-Arp $arpList2 $t.ARPName).Count -gt 0) { $still = $true } }
-    if ($still -or $t.PortableExeSignatures -or $t.InstallerSignatures) { $residual += $t }
-  }
-
-  $roots = @()
-  if ($activeUser) { $roots += (Get-PresenceZonesForUser $activeUser) }
-  $roots += (Get-ShallowCDrives)
-  $roots = $roots | Where-Object { $_ } | Select-Object -Unique
-
-  Log ("Index roots: " + ($roots -join '; '))
-  Log "Starting filesystem index pass"
-  $idxStart = Get-Date
-
-  $fileIndex = Index-Files $roots 2
-  Log (("Completed filesystem index pass. Indexed file keys={0} elapsedSec={1}" -f $fileIndex.Keys.Count, [int](New-TimeSpan -Start $idxStart -End (Get-Date)).TotalSeconds))
-
+  Log "Starting Residual Pass"
   $portableVerifiedGone = $true
   $foundAnyArtifacts = $false
+  try {
+    Log "Starting post-removal UWP snapshot"
+    $uwp2Start = Get-Date
+    $uwpSet2 = Snapshot-Uwp
+    Log (("Completed post-removal UWP snapshot. Package families indexed={0} elapsedSec={1}" -f $uwpSet2.Count, [int](New-TimeSpan -Start $uwp2Start -End (Get-Date)).TotalSeconds))
 
-  foreach ($t in $residual) {
-    $stems = Build-Stems $t
-    if (-not $stems -or $stems.Count -eq 0) { continue }
-    if ($activeUser) {
-      $shortcutRemoved = Remove-QuickLaunchMatches $activeUser $stems
-      if ($shortcutRemoved) { $removedThisRun += $t.Name }
+    Log "Starting post-removal ARP snapshot"
+    $arp2Start = Get-Date
+    $arpList2 = Snapshot-Arp
+    Log (("Completed post-removal ARP snapshot. Entries indexed={0} elapsedSec={1}" -f $arpList2.Count, [int](New-TimeSpan -Start $arp2Start -End (Get-Date)).TotalSeconds))
+
+    $residual = @()
+    foreach ($t in $targets) {
+      $still = $false
+      if ($t.UWPFamily -and $uwpSet2.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $still = $true }
+      if (-not $still -and $t.ARPName) { if ((Match-Arp $arpList2 $t.ARPName).Count -gt 0) { $still = $true } }
+      if ($still -or $t.PortableExeSignatures -or $t.InstallerSignatures) { $residual += $t }
     }
-    $hits = Find-MatchingFiles $fileIndex $stems
-    if ($hits.Count -gt 0) {
-      $foundAnyArtifacts = $true
-      Log ("Removing artifacts for " + $t.Name + " hits=" + $hits.Count)
-      Remove-Paths $hits
-      $removedThisRun += $t.Name
-      foreach ($p in $hits) { if (Test-Path $p) { $portableVerifiedGone = $false } }
+
+    $roots = @()
+    if ($activeUser) { $roots += (Get-PresenceZonesForUser $activeUser) }
+    $roots += (Get-ShallowCDrives)
+    $roots = $roots | Where-Object { $_ } | Select-Object -Unique
+
+    Log ("Index roots: " + ($roots -join '; '))
+    Log "Starting filesystem index pass"
+    $idxStart = Get-Date
+
+    $fileIndex = Index-Files $roots 2
+    Log (("Completed filesystem index pass. Indexed file keys={0} elapsedSec={1}" -f $fileIndex.Keys.Count, [int](New-TimeSpan -Start $idxStart -End (Get-Date)).TotalSeconds))
+
+    foreach ($t in $residual) {
+      $stems = Build-Stems $t
+      if (-not $stems -or $stems.Count -eq 0) { continue }
+      if ($activeUser) {
+        $shortcutRemoved = Remove-QuickLaunchMatches $activeUser $stems
+        if ($shortcutRemoved) { $removedThisRun += $t.Name }
+      }
+      $hits = Find-MatchingFiles $fileIndex $stems
+      if ($hits.Count -gt 0) {
+        $foundAnyArtifacts = $true
+        Log ("Removing artifacts for " + $t.Name + " hits=" + $hits.Count)
+        Remove-Paths $hits
+        $removedThisRun += $t.Name
+        foreach ($p in $hits) { if (Test-Path $p) { $portableVerifiedGone = $false } }
+      }
     }
+  } catch {
+    $line = if ($_.InvocationInfo -and $_.InvocationInfo.ScriptLineNumber) { $_.InvocationInfo.ScriptLineNumber } else { "unknown" }
+    Log ("Stage failure [Residual Pass]: message='" + $_.Exception.Message + "' line=" + $line) "ERROR"
+    $scriptExitCode = 1
   }
   Log "Completed Residual Pass"
 
@@ -554,7 +565,7 @@ try {
   Write-JsonFile $StateFile $state
 
   if (-not $portableVerifiedGone) {
-    Log "Portable verification failed (some artifacts remain)." "WARN"
+    Log -m "Portable verification failed (some artifacts remain)." -lvl "WARN"
     $scriptExitCode = 1
   }
 }
@@ -1627,20 +1638,113 @@ function Remediate-Log([string]$m, [string]$lvl='INFO') {
   } catch {}
 }
 
+function Ensure-ScheduledTaskFolder([string]$taskPath) {
+  try {
+    $normalized = $taskPath
+    if (-not $normalized.StartsWith("\\")) { $normalized = "\\" + $normalized }
+    if (-not $normalized.EndsWith("\\")) { $normalized = $normalized + "\\" }
+
+    $svc = New-Object -ComObject 'Schedule.Service'
+    $svc.Connect()
+    $root = $svc.GetFolder('\\')
+    $trimmed = $normalized.Trim('\\')
+    if (-not $trimmed) { return $true }
+
+    $parts = $trimmed.Split('\\')
+    $currentPath = ''
+    foreach ($part in $parts) {
+      if (-not $part) { continue }
+      $currentPath = "{0}\\{1}" -f $currentPath.TrimEnd('\\'), $part
+      if (-not $currentPath.StartsWith('\\')) { $currentPath = "\\" + $currentPath.TrimStart('\\') }
+      try {
+        $null = $svc.GetFolder($currentPath)
+      } catch {
+        $parentPath = Split-Path -Path $currentPath -Parent
+        if (-not $parentPath) { $parentPath = '\\' }
+        $folderName = Split-Path -Path $currentPath -Leaf
+        $parent = $svc.GetFolder($parentPath)
+        $null = $parent.CreateFolder($folderName, $null)
+      }
+    }
+    Remediate-Log ("Ensured scheduled task folder exists: " + $normalized)
+    return $true
+  } catch {
+    Remediate-Log ("Failed to ensure scheduled task folder: " + $taskPath) 'ERROR'
+    return $false
+  }
+}
+
+function Get-TaskQueryDiagnostics([string]$fullTaskName) {
+  $diag = @{
+    Success = $false
+    NextRunTime = ''
+    LastResult = ''
+  }
+
+  try {
+    $queryOutput = @(schtasks /Query /TN "$fullTaskName" /V /FO LIST 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+      Remediate-Log ("Task query failed for $fullTaskName: " + ($queryOutput -join ' ')) 'ERROR'
+      return $diag
+    }
+
+    $wanted = @('TaskName','Next Run Time','Last Run Time','Last Result','Task To Run','Schedule Type')
+    foreach ($field in $wanted) {
+      $line = $queryOutput | Where-Object { $_ -like ("$field:*") } | Select-Object -First 1
+      if ($line) {
+        Remediate-Log ("TaskDiagnostics $line")
+        if ($field -eq 'Next Run Time') { $diag.NextRunTime = ($line -replace '^Next Run Time:\s*','').Trim() }
+        if ($field -eq 'Last Result') { $diag.LastResult = ($line -replace '^Last Result:\s*','').Trim() }
+      } else {
+        Remediate-Log ("TaskDiagnostics $field: <missing>") 'WARN'
+      }
+    }
+
+    $nextRunInvalid = ([string]::IsNullOrWhiteSpace($diag.NextRunTime) -or $diag.NextRunTime -eq 'N/A')
+    $lastResultFailed = $true
+    if (-not [string]::IsNullOrWhiteSpace($diag.LastResult)) {
+      if ($diag.LastResult -match '\(0x0\)' -or $diag.LastResult -eq '0') { $lastResultFailed = $false }
+    }
+
+    if ($nextRunInvalid) {
+      Remediate-Log ("Task validation failed: Next Run Time is not valid for " + $fullTaskName) 'ERROR'
+      return $diag
+    }
+    if ($lastResultFailed) {
+      Remediate-Log ("Task validation failed: Last Result indicates failure for " + $fullTaskName + " => " + $diag.LastResult) 'ERROR'
+      return $diag
+    }
+
+    $diag.Success = $true
+    return $diag
+  } catch {
+    Remediate-Log ("Task diagnostics exception for " + $fullTaskName) 'ERROR'
+    return $diag
+  }
+}
+
 function Register-CleanAgentTask {
+  $taskPath = '\\RSD\\'
   $taskName = 'RSD-CleanAGENT'
+  $fullTaskName = "${taskPath}${taskName}"
   $taskDesc = 'RSD local cleaning agent. Runs hourly; script enforces adaptive backoff schedule.'
   $ps = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
   $args = "-NoProfile -ExecutionPolicy Bypass -File `"$AgentScript`""
   $created = $false
 
+  if (-not (Ensure-ScheduledTaskFolder $taskPath)) {
+    Remediate-Log "Task folder preparation failed" 'ERROR'
+    return $false
+  }
+
   # If task already exists, keep it (avoid delete/recreate churn on repeated Intune runs).
   try {
-    schtasks /Query /TN "$taskName" /FO LIST | Out-Null
+    schtasks /Query /TN "$fullTaskName" /FO LIST | Out-Null
     if ($LASTEXITCODE -eq 0) {
-      Remediate-Log ("Existing task already present: " + $taskName)
-      try { schtasks /Run /TN "$taskName" | Out-Null } catch {}
-      return $true
+      Remediate-Log ("Existing task already present: " + $fullTaskName)
+      try { schtasks /Run /TN "$fullTaskName" | Out-Null } catch {}
+      $diag = Get-TaskQueryDiagnostics $fullTaskName
+      return $diag.Success
     }
   } catch {}
 
@@ -1660,40 +1764,41 @@ function Register-CleanAgentTask {
       $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
       $task = New-ScheduledTask -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description $taskDesc
 
-      Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
+      Register-ScheduledTask -TaskName $taskName -TaskPath $taskPath -InputObject $task -Force | Out-Null
       $created = $true
       Remediate-Log "Registered task via ScheduledTasks module"
     } catch {
-      Remediate-Log "ScheduledTasks registration failed; falling back to schtasks.exe" 'WARN'
+      Remediate-Log -m "ScheduledTasks registration failed; falling back to schtasks.exe" -lvl 'WARN'
     }
   } else {
-    Remediate-Log "ScheduledTasks cmdlets unavailable; using schtasks.exe fallback" 'WARN'
+    Remediate-Log -m "ScheduledTasks cmdlets unavailable; using schtasks.exe fallback" -lvl 'WARN'
   }
 
   if (-not $created) {
     try {
       $tr = "`"$ps`" -NoProfile -ExecutionPolicy Bypass -File `"$AgentScript`""
-      Remediate-Log ("Creating scheduled task via schtasks: " + $taskName)
-      schtasks /Create /F /RU "SYSTEM" /RL HIGHEST /SC HOURLY /MO 1 /TN "$taskName" /TR "$tr" | Out-Null
+      Remediate-Log ("Creating scheduled task via schtasks: " + $fullTaskName)
+      schtasks /Create /F /RU "SYSTEM" /RL HIGHEST /SC HOURLY /MO 1 /TN "$fullTaskName" /TR "$tr" | Out-Null
     } catch {
-      Remediate-Log "schtasks.exe /Create threw an exception" 'ERROR'
+      Remediate-Log -m "schtasks.exe /Create threw an exception" -lvl 'ERROR'
     }
   }
 
   # Exact verification pass and immediate run
   try {
-    schtasks /Query /TN "$taskName" /FO LIST | Out-Null
+    schtasks /Query /TN "$fullTaskName" /FO LIST | Out-Null
     if ($LASTEXITCODE -eq 0) {
-      Remediate-Log "Task present after registration: $taskName"
-      try { schtasks /Run /TN "$taskName" | Out-Null } catch {}
-      return $true
+      Remediate-Log "Task present after registration: $fullTaskName"
+      try { schtasks /Run /TN "$fullTaskName" | Out-Null } catch {}
+      $diag = Get-TaskQueryDiagnostics $fullTaskName
+      return $diag.Success
     }
 
-    $err = (schtasks /Query /TN "$taskName" /FO LIST 2>&1 | Out-String)
+    $err = (schtasks /Query /TN "$fullTaskName" /FO LIST 2>&1 | Out-String)
     if ($err) { Remediate-Log ("Task query error: " + $err.Trim()) 'ERROR' }
   } catch {}
 
-  Remediate-Log "Task registration verification failed: $taskName" 'ERROR'
+  Remediate-Log "Task registration verification failed: $fullTaskName" 'ERROR'
   return $false
 }
 
@@ -1714,7 +1819,7 @@ function Invoke-CleanAgentNow {
       if ($done) { Remediate-Log ("Immediate cleanAGENT run finished with exit code " + $p.ExitCode) }
       else {
         try { $p.Kill() } catch {}
-        Remediate-Log "Immediate cleanAGENT run timed out after 10 minutes" 'WARN'
+        Remediate-Log -m "Immediate cleanAGENT run timed out after 10 minutes" -lvl 'WARN'
       }
 
       $latestCleanLog = $null
@@ -1736,10 +1841,10 @@ function Invoke-CleanAgentNow {
         }
       }
     } else {
-      Remediate-Log "Failed to start immediate cleanAGENT run process" 'ERROR'
+      Remediate-Log -m "Failed to start immediate cleanAGENT run process" -lvl 'ERROR'
     }
   } catch {
-    Remediate-Log "Immediate cleanAGENT run threw an exception" 'ERROR'
+    Remediate-Log -m "Immediate cleanAGENT run threw an exception" -lvl 'ERROR'
   }
 }
 
@@ -1767,12 +1872,13 @@ Set-RsdFileAcl $StateFile
 
 Remediate-Log "Starting remediation deployment version $ThisVersion"
 $taskName = "RSD-CleanAGENT"
+$taskPath = "\\RSD\\"
 $taskOk = Register-CleanAgentTask
 if (-not $taskOk) {
-  Remediate-Log "Remediation deployment completed with task registration failure" "ERROR"
+  Remediate-Log -m "Remediation deployment completed with task registration failure" -lvl "ERROR"
   exit 1
 }
-try { Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue } catch {}
+try { Start-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction SilentlyContinue } catch {}
 Invoke-CleanAgentNow
 Remediate-Log "Remediation deployment complete"
 exit 0
