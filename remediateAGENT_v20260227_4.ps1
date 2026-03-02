@@ -1,7 +1,7 @@
 <#
 RSD CleanAgent - Intune Proactive Remediation Remediation
 PowerShell 5.1 compatible
-Version: 2026.03.02.1
+Version: 2026.03.02.2
 
 Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
 #>
@@ -16,12 +16,12 @@ $VersionFile = Join-Path $AgentRoot 'version.txt'
 $StateFile   = Join-Path $AgentRoot 'state.json'
 $LogDir      = Join-Path $AgentRoot 'Logs'
 
-$ThisVersion = '2026.03.02.1'
+$ThisVersion = '2026.03.02.2'
 
 $AgentPayload = @'
 <#
 RSD CleanAgent (local) - PowerShell 5.1
-Version: 2026.03.02.1
+Version: 2026.03.02.2
 
 Behavior:
 - Batch inventory UWP/ARP once per run.
@@ -64,18 +64,44 @@ function Write-JsonFile([string]$path, $obj) {
   try { ($obj | ConvertTo-Json -Depth 8) | Set-Content -Path $path -Encoding UTF8 } catch {}
 }
 
+function Get-ActiveUserSid([string]$user) {
+  if (-not $user) { return $null }
+  try {
+    $profiles = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction SilentlyContinue
+    foreach ($p in $profiles) {
+      if (-not $p.LocalPath) { continue }
+      if ($p.LocalPath -ieq ("C:\Users\{0}" -f $user)) { return $p.SID }
+    }
+  } catch {}
+  return $null
+}
+
+function Invoke-RegLoadWithTimeout([string]$hiveName, [string]$ntUserDat, [int]$timeoutMs) {
+  try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'reg.exe'
+    $psi.Arguments = "load HKU\$hiveName `"$ntUserDat`""
+    $psi.CreateNoWindow = $true
+    $psi.UseShellExecute = $false
+    $p = [System.Diagnostics.Process]::Start($psi)
+    if (-not $p) { return $false }
+    if (-not $p.WaitForExit($timeoutMs)) {
+      try { $p.Kill() } catch {}
+      Remediate-Log ("reg load timeout for hive " + $hiveName) 'WARN'
+      return $false
+    }
+    return ($p.ExitCode -eq 0)
+  } catch { return $false }
+}
+
 function Set-OneDriveDeletePromptPolicyForUser([string]$user) {
   if (-not $user) { return }
 
-  $sid = $null
-  try {
-    $acct = New-Object System.Security.Principal.NTAccount($env:COMPUTERNAME, $user)
-    $sid = $acct.Translate([System.Security.Principal.SecurityIdentifier]).Value
-  } catch {}
-
-  if ($sid -and (Test-Path ("Registry::HKEY_USERS\\{0}" -f $sid))) {
+  # First preference: active loaded user hive by SID (fast, no hive mount/unmount risk).
+  $sid = Get-ActiveUserSid $user
+  if ($sid -and (Test-Path ("Registry::HKEY_USERS\{0}" -f $sid))) {
     try {
-      $loadedPath = "Registry::HKEY_USERS\\{0}\\Software\\Microsoft\\OneDrive" -f $sid
+      $loadedPath = "Registry::HKEY_USERS\{0}\Software\Microsoft\OneDrive" -f $sid
       if (-not (Test-Path $loadedPath)) { New-Item -Path $loadedPath -Force | Out-Null }
       New-ItemProperty -Path $loadedPath -Name 'DisableFirstDeleteDialog' -Value 1 -PropertyType DWord -Force | Out-Null
       Log ("Applied HKCU OneDrive policy to loaded hive SID=" + $sid)
@@ -83,26 +109,27 @@ function Set-OneDriveDeletePromptPolicyForUser([string]$user) {
     } catch {}
   }
 
+  # Fallback: mount NTUSER.DAT with timeout so we cannot block the clean pass.
   $ntUser = "C:\Users\{0}\NTUSER.DAT" -f $user
   if (-not (Test-Path $ntUser)) { return }
 
   $mounted = $false
   try {
-    if (-not (Test-Path 'Registry::HKEY_USERS\\RSDTEMP')) {
-      reg.exe load "HKU\\RSDTEMP" "$ntUser" | Out-Null
-      if ($LASTEXITCODE -eq 0) { $mounted = $true }
+    if (-not (Test-Path 'Registry::HKEY_USERS\RSDTEMP')) {
+      $mounted = Invoke-RegLoadWithTimeout 'RSDTEMP' $ntUser 5000
     }
-    if (Test-Path 'Registry::HKEY_USERS\\RSDTEMP') {
-      $userPath = 'Registry::HKEY_USERS\\RSDTEMP\\Software\\Microsoft\\OneDrive'
+    if (Test-Path 'Registry::HKEY_USERS\RSDTEMP') {
+      $userPath = 'Registry::HKEY_USERS\RSDTEMP\Software\Microsoft\OneDrive'
       if (-not (Test-Path $userPath)) { New-Item -Path $userPath -Force | Out-Null }
       New-ItemProperty -Path $userPath -Name 'DisableFirstDeleteDialog' -Value 1 -PropertyType DWord -Force | Out-Null
       Log ("Applied HKCU OneDrive policy using mounted temp hive for user=" + $user)
     }
   } catch {}
   finally {
-    if ($mounted) { try { reg.exe unload "HKU\\RSDTEMP" | Out-Null } catch {} }
+    if ($mounted) { try { reg.exe unload "HKU\RSDTEMP" | Out-Null } catch {} }
   }
 }
+
 
 function Disable-OneDriveDeletePrompt([string]$user) {
   try {
@@ -1557,7 +1584,7 @@ function Remediate-Log([string]$m, [string]$lvl='INFO') {
 }
 
 function Register-CleanAgentTask {
-  $taskName = 'RSD Clean Agent'
+  $taskName = 'RSD-CleanAGENT'
   $taskDesc = 'RSD local cleaning agent. Runs hourly; script enforces adaptive backoff schedule.'
   $ps = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
   $args = "-NoProfile -ExecutionPolicy Bypass -File `"$AgentScript`""
@@ -1565,6 +1592,7 @@ function Register-CleanAgentTask {
 
   # Always clear any stale task first (best effort)
   try { schtasks /Delete /F /TN "$taskName" | Out-Null } catch {}
+  Remediate-Log ("Ensured old task is removed (if present): " + $taskName)
 
   $useScheduledTasksModule = $true
   foreach ($cmd in @('New-ScheduledTaskTrigger','New-ScheduledTaskAction','New-ScheduledTaskSettingsSet','New-ScheduledTaskPrincipal','New-ScheduledTask','Register-ScheduledTask')) {
@@ -1594,14 +1622,18 @@ function Register-CleanAgentTask {
 
   if (-not $created) {
     try {
-      schtasks /Create /F /RU "SYSTEM" /RL HIGHEST /SC HOURLY /MO 1 /TN "$taskName" /TR "`"$ps`" $args" | Out-Null
+      Remediate-Log ("Creating scheduled task via schtasks: " + $taskName)
+      schtasks /Create /F /RU "SYSTEM" /RL HIGHEST /SC HOURLY /MO 1 /ST 00:00 /TN "$taskName" /TR "`"$ps`" $args" | Out-Null
     } catch {}
   }
 
   # Verification pass and immediate run
   try {
     $query = schtasks /Query /TN "$taskName" /FO LIST 2>$null
-    if ($LASTEXITCODE -eq 0) {
+    if ($LASTEXITCODE -ne 0) {
+      $query = schtasks /Query /FO LIST /V 2>$null | Select-String -SimpleMatch $taskName
+    }
+    if ($query) {
       Remediate-Log "Task present after registration: $taskName"
       try { schtasks /Run /TN "$taskName" | Out-Null } catch {}
       return $true
@@ -1635,10 +1667,12 @@ Set-RsdFileAcl $VersionFile
 Set-RsdFileAcl $StateFile
 
 Remediate-Log "Starting remediation deployment version $ThisVersion"
+$taskName = "RSD-CleanAGENT"
 $taskOk = Register-CleanAgentTask
 if (-not $taskOk) {
   Remediate-Log "Remediation deployment completed with task registration failure" "ERROR"
   exit 1
 }
+try { Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue } catch {}
 Remediate-Log "Remediation deployment complete"
 exit 0
