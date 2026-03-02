@@ -1,7 +1,7 @@
 <#
 RSD CleanAgent - Intune Proactive Remediation Remediation
 PowerShell 5.1 compatible
-Version: 2026.02.27.4
+Version: 2026.02.27.5
 
 Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
 #>
@@ -16,12 +16,12 @@ $VersionFile = Join-Path $AgentRoot 'version.txt'
 $StateFile   = Join-Path $AgentRoot 'state.json'
 $LogDir      = Join-Path $AgentRoot 'Logs'
 
-$ThisVersion = '2026.02.27.4'
+$ThisVersion = '2026.02.27.5'
 
 $AgentPayload = @'
 <#
 RSD CleanAgent (local) - PowerShell 5.1
-Version: 2026.02.27.4
+Version: 2026.02.27.5
 
 Behavior:
 - Batch inventory UWP/ARP once per run.
@@ -64,12 +64,33 @@ function Write-JsonFile([string]$path, $obj) {
   try { ($obj | ConvertTo-Json -Depth 8) | Set-Content -Path $path -Encoding UTF8 } catch {}
 }
 
-function Disable-OneDriveDeletePrompt {
+function Set-OneDriveDeletePromptPolicyForUser([string]$user) {
+  if (-not $user) { return }
+  $ntUser = "C:\Users\{0}\NTUSER.DAT" -f $user
+  if (-not (Test-Path $ntUser)) { return }
+
+  $mounted = $false
+  try {
+    if (-not (Test-Path 'Registry::HKEY_USERS\\RSDTEMP')) {
+      reg.exe load "HKU\\RSDTEMP" "$ntUser" | Out-Null
+      if ($LASTEXITCODE -eq 0) { $mounted = $true }
+    }
+    $userPath = 'Registry::HKEY_USERS\\RSDTEMP\\Software\\Microsoft\\OneDrive'
+    if (-not (Test-Path $userPath)) { New-Item -Path $userPath -Force | Out-Null }
+    New-ItemProperty -Path $userPath -Name 'DisableFirstDeleteDialog' -Value 1 -PropertyType DWord -Force | Out-Null
+  } catch {}
+  finally {
+    if ($mounted) { try { reg.exe unload "HKU\\RSDTEMP" | Out-Null } catch {} }
+  }
+}
+
+function Disable-OneDriveDeletePrompt([string]$user) {
   try {
     $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive'
     if (-not (Test-Path $policyPath)) { New-Item -Path $policyPath -Force | Out-Null }
-    Set-ItemProperty -Path $policyPath -Name 'DisableFirstDeleteDialog' -Value 1 -Type DWord
+    New-ItemProperty -Path $policyPath -Name 'DisableFirstDeleteDialog' -Value 1 -PropertyType DWord -Force | Out-Null
   } catch {}
+  Set-OneDriveDeletePromptPolicyForUser $user
 }
 
 function Is-DueToRun($state) {
@@ -223,7 +244,11 @@ function Get-PresenceZonesForUser([string]$user) {
 }
 
 function Get-ShallowCDrives() {
-  $skip = @('windows','program files','program files (x86)','programdata','users','perflogs','recovery','system volume information','$recycle.bin','msocache')
+  $skip = @(
+    'windows','program files','program files (x86)','programdata','users','recovery',
+    'classpolicy','documents and settings','hp','inetpub','onedrivetemp','swsetup','system.sav',
+    'perflogs','system volume information','$recycle.bin','msocache'
+  )
   $out = @()
   try {
     Get-ChildItem -Path 'C:\' -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
@@ -303,115 +328,170 @@ function Remove-Paths([string[]]$paths) {
   }
 }
 
-# MAIN
-Disable-OneDriveDeletePrompt
+function Remove-QuickLaunchMatches([string]$user, [string[]]$stems) {
+  if (-not $user -or -not $stems -or $stems.Count -eq 0) { return $false }
+  $root = "C:\Users\{0}\AppData\Roaming\Microsoft\Internet Explorer\Quick Launch" -f $user
+  if (-not (Test-Path $root)) { return $false }
 
-$state = Read-JsonFile $StateFile @{ phase=0; phaseStart=(Get-Date).ToString('o'); lastDetect=(Get-Date).ToString('o'); lastRun=(Get-Date).ToString('o'); lastFound=@() }
-$state = Advance-PhaseIfTime $state
-
-if (-not (Is-DueToRun $state)) {
-  $state.lastRun = (Get-Date).ToString('o')
-  Write-JsonFile $StateFile $state
-  exit 0
-}
-
-$activeUser = Get-ActiveUser
-Log ("Active user: " + $activeUser)
-
-$targets = Get-Targets
-if (-not $targets -or $targets.Count -eq 0) {
-  Log "targets.json missing/empty." "WARN"
-  $state.lastRun = (Get-Date).ToString('o')
-  Write-JsonFile $StateFile $state
-  exit 0
-}
-
-$uwpSet = Snapshot-Uwp
-$arpList = Snapshot-Arp
-
-$foundThisRun = @()
-$removedThisRun = @()
-
-# Pass 1: remove UWP + quiet ARP
-foreach ($t in $targets) {
-  $present = $false
-  if ($t.UWPFamily -and $uwpSet.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $present = $true; $foundThisRun += $t.Name }
-  if (-not $present -and $t.ARPName) {
-    if ((Match-Arp $arpList $t.ARPName).Count -gt 0) { $present = $true; $foundThisRun += $t.Name }
-  }
-  if (-not $present) { continue }
-
-  $did = $false
-  if ($t.UWPFamily) { $did = (Remove-UwpFamily $t.UWPFamily) -or $did }
-
-  if ($t.ARPName) {
-    $matches = Match-Arp $arpList $t.ARPName
-    foreach ($e in $matches) {
-      if ($e.QuietUninstallString) {
-        Log ("Quiet uninstall ARP: " + $e.DisplayName)
-        $ok = Invoke-QuietUninstall $e.QuietUninstallString
-        if ($ok) { $did = $true } else { Log ("Quiet uninstall failed: " + $e.DisplayName) "WARN" }
-      } else {
-        Log ("No QuietUninstallString for: " + $e.DisplayName) "WARN"
+  $removed = $false
+  try {
+    Get-ChildItem -LiteralPath $root -File -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+      $n = $_.Name.ToLowerInvariant()
+      foreach ($s in $stems) {
+        $needle = $s.ToLowerInvariant()
+        if ($needle.Length -lt 4) { continue }
+        if ($n -like ('*' + $needle + '*')) {
+          try {
+            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+            $removed = $true
+            Log ("Removed Quick Launch shortcut: " + $_.FullName)
+          } catch {}
+          break
+        }
       }
+    }
+  } catch {}
+
+  return $removed
+}
+
+# MAIN
+$scriptExitCode = 0
+$mutexName = 'Global\\RSDCleanAgentMutex'
+$mutex = $null
+$mutexOwned = $false
+
+try {
+  try {
+    $mutex = New-Object System.Threading.Mutex($false, $mutexName)
+    $mutexOwned = $mutex.WaitOne(0, $false)
+    if (-not $mutexOwned) { return }
+  } catch {}
+
+  $state = Read-JsonFile $StateFile @{ phase=0; phaseStart=(Get-Date).ToString('o'); lastDetect=(Get-Date).ToString('o'); lastRun=(Get-Date).ToString('o'); lastFound=@() }
+  $state = Advance-PhaseIfTime $state
+
+  if (-not (Is-DueToRun $state)) {
+    $state.lastRun = (Get-Date).ToString('o')
+    Write-JsonFile $StateFile $state
+    return
+  }
+
+  $activeUser = Get-ActiveUser
+  Log ("Active user: " + $activeUser)
+  Disable-OneDriveDeletePrompt $activeUser
+
+  $targets = Get-Targets
+  if (-not $targets -or $targets.Count -eq 0) {
+    Log "targets.json missing/empty." "WARN"
+    $state.lastRun = (Get-Date).ToString('o')
+    Write-JsonFile $StateFile $state
+    return
+  }
+
+  $uwpSet = Snapshot-Uwp
+  $arpList = Snapshot-Arp
+
+  $foundThisRun = @()
+  $removedThisRun = @()
+
+  # Pass 1: remove UWP + quiet ARP
+  foreach ($t in $targets) {
+    $present = $false
+    if ($t.UWPFamily -and $uwpSet.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $present = $true; $foundThisRun += $t.Name }
+    if (-not $present -and $t.ARPName) {
+      if ((Match-Arp $arpList $t.ARPName).Count -gt 0) { $present = $true; $foundThisRun += $t.Name }
+    }
+    if (-not $present) { continue }
+
+    $did = $false
+    if ($t.UWPFamily) { $did = (Remove-UwpFamily $t.UWPFamily) -or $did }
+
+    if ($t.ARPName) {
+      $matches = Match-Arp $arpList $t.ARPName
+      foreach ($e in $matches) {
+        if ($e.QuietUninstallString) {
+          Log ("Quiet uninstall ARP: " + $e.DisplayName)
+          $ok = Invoke-QuietUninstall $e.QuietUninstallString
+          if ($ok) { $did = $true } else { Log ("Quiet uninstall failed: " + $e.DisplayName) "WARN" }
+        } else {
+          Log ("No QuietUninstallString for: " + $e.DisplayName) "WARN"
+        }
+      }
+    }
+
+    if ($did) { $removedThisRun += $t.Name }
+  }
+
+  # Refresh & residual filesystem pass (portable/installer artifacts)
+  $uwpSet2 = Snapshot-Uwp
+  $arpList2 = Snapshot-Arp
+
+  $residual = @()
+  foreach ($t in $targets) {
+    $still = $false
+    if ($t.UWPFamily -and $uwpSet2.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $still = $true }
+    if (-not $still -and $t.ARPName) { if ((Match-Arp $arpList2 $t.ARPName).Count -gt 0) { $still = $true } }
+    if ($still -or $t.PortableExeSignatures -or $t.InstallerSignatures) { $residual += $t }
+  }
+
+  $roots = @()
+  if ($activeUser) { $roots += (Get-PresenceZonesForUser $activeUser) }
+  $roots += (Get-ShallowCDrives)
+  $roots = $roots | Where-Object { $_ } | Select-Object -Unique
+
+  Log ("Index roots: " + ($roots -join '; '))
+
+  $fileIndex = Index-Files $roots 2
+
+  $portableVerifiedGone = $true
+  $foundAnyArtifacts = $false
+
+  foreach ($t in $residual) {
+    $stems = Build-Stems $t
+    if (-not $stems -or $stems.Count -eq 0) { continue }
+    if ($activeUser) {
+      $shortcutRemoved = Remove-QuickLaunchMatches $activeUser $stems
+      if ($shortcutRemoved) { $removedThisRun += $t.Name }
+    }
+    $hits = Find-MatchingFiles $fileIndex $stems
+    if ($hits.Count -gt 0) {
+      $foundAnyArtifacts = $true
+      Log ("Removing artifacts for " + $t.Name + " hits=" + $hits.Count)
+      Remove-Paths $hits
+      $removedThisRun += $t.Name
+      foreach ($p in $hits) { if (Test-Path $p) { $portableVerifiedGone = $false } }
     }
   }
 
-  if ($did) { $removedThisRun += $t.Name }
+  $foundAny = ($foundThisRun | Select-Object -Unique)
+  if ($foundAny.Count -gt 0 -or $foundAnyArtifacts) {
+    $state = Reset-Phase $state
+    $state.lastDetect = (Get-Date).ToString('o')
+    $state.lastFound = $foundAny
+    Update-Receipt ($removedThisRun | Select-Object -Unique)
+  } else {
+    $state = Advance-PhaseIfTime $state
+  }
+
+  $state.lastRun = (Get-Date).ToString('o')
+  Write-JsonFile $StateFile $state
+
+  if (-not $portableVerifiedGone) {
+    Log "Portable verification failed (some artifacts remain)." "WARN"
+    $scriptExitCode = 1
+  }
 }
-
-# Refresh & residual filesystem pass (portable/installer artifacts)
-$uwpSet2 = Snapshot-Uwp
-$arpList2 = Snapshot-Arp
-
-$residual = @()
-foreach ($t in $targets) {
-  $still = $false
-  if ($t.UWPFamily -and $uwpSet2.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $still = $true }
-  if (-not $still -and $t.ARPName) { if ((Match-Arp $arpList2 $t.ARPName).Count -gt 0) { $still = $true } }
-  if ($still -or $t.PortableExeSignatures -or $t.InstallerSignatures) { $residual += $t }
-}
-
-$roots = @()
-if ($activeUser) { $roots += (Get-PresenceZonesForUser $activeUser) }
-$roots += (Get-ShallowCDrives)
-$roots = $roots | Where-Object { $_ } | Select-Object -Unique
-
-Log ("Index roots: " + ($roots -join '; '))
-
-$fileIndex = Index-Files $roots 2
-
-$portableVerifiedGone = $true
-$foundAnyArtifacts = $false
-
-foreach ($t in $residual) {
-  $stems = Build-Stems $t
-  if (-not $stems -or $stems.Count -eq 0) { continue }
-  $hits = Find-MatchingFiles $fileIndex $stems
-  if ($hits.Count -gt 0) {
-    $foundAnyArtifacts = $true
-    Log ("Removing artifacts for " + $t.Name + " hits=" + $hits.Count)
-    Remove-Paths $hits
-    $removedThisRun += $t.Name
-    foreach ($p in $hits) { if (Test-Path $p) { $portableVerifiedGone = $false } }
+finally {
+  if ($mutexOwned -and $mutex) {
+    try { $mutex.ReleaseMutex() | Out-Null } catch {}
+  }
+  if ($mutex) {
+    try { $mutex.Dispose() } catch {}
   }
 }
 
-$foundAny = ($foundThisRun | Select-Object -Unique)
-if ($foundAny.Count -gt 0 -or $foundAnyArtifacts) {
-  $state = Reset-Phase $state
-  $state.lastDetect = (Get-Date).ToString('o')
-  $state.lastFound = $foundAny
-  Update-Receipt ($removedThisRun | Select-Object -Unique)
-} else {
-  $state = Advance-PhaseIfTime $state
-}
-
-$state.lastRun = (Get-Date).ToString('o')
-Write-JsonFile $StateFile $state
-
-if (-not $portableVerifiedGone) { Log "Portable verification failed (some artifacts remain)." "WARN"; exit 1 }
-exit 0
+exit $scriptExitCode
 
 '@
 
