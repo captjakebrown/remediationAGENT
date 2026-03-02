@@ -1,7 +1,7 @@
 <#
 RSD CleanAgent - Intune Proactive Remediation Remediation
 PowerShell 5.1 compatible
-Version: 2026.02.27.5
+Version: 2026.03.02.1
 
 Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
 #>
@@ -16,12 +16,12 @@ $VersionFile = Join-Path $AgentRoot 'version.txt'
 $StateFile   = Join-Path $AgentRoot 'state.json'
 $LogDir      = Join-Path $AgentRoot 'Logs'
 
-$ThisVersion = '2026.02.27.5'
+$ThisVersion = '2026.03.02.1'
 
 $AgentPayload = @'
 <#
 RSD CleanAgent (local) - PowerShell 5.1
-Version: 2026.02.27.5
+Version: 2026.03.02.1
 
 Behavior:
 - Batch inventory UWP/ARP once per run.
@@ -66,6 +66,23 @@ function Write-JsonFile([string]$path, $obj) {
 
 function Set-OneDriveDeletePromptPolicyForUser([string]$user) {
   if (-not $user) { return }
+
+  $sid = $null
+  try {
+    $acct = New-Object System.Security.Principal.NTAccount($env:COMPUTERNAME, $user)
+    $sid = $acct.Translate([System.Security.Principal.SecurityIdentifier]).Value
+  } catch {}
+
+  if ($sid -and (Test-Path ("Registry::HKEY_USERS\\{0}" -f $sid))) {
+    try {
+      $loadedPath = "Registry::HKEY_USERS\\{0}\\Software\\Microsoft\\OneDrive" -f $sid
+      if (-not (Test-Path $loadedPath)) { New-Item -Path $loadedPath -Force | Out-Null }
+      New-ItemProperty -Path $loadedPath -Name 'DisableFirstDeleteDialog' -Value 1 -PropertyType DWord -Force | Out-Null
+      Log ("Applied HKCU OneDrive policy to loaded hive SID=" + $sid)
+      return
+    } catch {}
+  }
+
   $ntUser = "C:\Users\{0}\NTUSER.DAT" -f $user
   if (-not (Test-Path $ntUser)) { return }
 
@@ -75,9 +92,12 @@ function Set-OneDriveDeletePromptPolicyForUser([string]$user) {
       reg.exe load "HKU\\RSDTEMP" "$ntUser" | Out-Null
       if ($LASTEXITCODE -eq 0) { $mounted = $true }
     }
-    $userPath = 'Registry::HKEY_USERS\\RSDTEMP\\Software\\Microsoft\\OneDrive'
-    if (-not (Test-Path $userPath)) { New-Item -Path $userPath -Force | Out-Null }
-    New-ItemProperty -Path $userPath -Name 'DisableFirstDeleteDialog' -Value 1 -PropertyType DWord -Force | Out-Null
+    if (Test-Path 'Registry::HKEY_USERS\\RSDTEMP') {
+      $userPath = 'Registry::HKEY_USERS\\RSDTEMP\\Software\\Microsoft\\OneDrive'
+      if (-not (Test-Path $userPath)) { New-Item -Path $userPath -Force | Out-Null }
+      New-ItemProperty -Path $userPath -Name 'DisableFirstDeleteDialog' -Value 1 -PropertyType DWord -Force | Out-Null
+      Log ("Applied HKCU OneDrive policy using mounted temp hive for user=" + $user)
+    }
   } catch {}
   finally {
     if ($mounted) { try { reg.exe unload "HKU\\RSDTEMP" | Out-Null } catch {} }
@@ -380,8 +400,10 @@ try {
   $activeUser = Get-ActiveUser
   Log ("Active user: " + $activeUser)
   Disable-OneDriveDeletePrompt $activeUser
+  Log "OneDrive delete prompt policy stage complete"
 
   $targets = Get-Targets
+  Log ("Target count loaded: " + $targets.Count)
   if (-not $targets -or $targets.Count -eq 0) {
     Log "targets.json missing/empty." "WARN"
     $state.lastRun = (Get-Date).ToString('o')
@@ -1525,31 +1547,69 @@ function Set-RsdFileAcl([string]$path) {
   } catch {}
 }
 
+
+function Remediate-Log([string]$m, [string]$lvl='INFO') {
+  try {
+    $p = Join-Path $LogDir 'remediateAGENT.log'
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    Add-Content -Path $p -Value ("{0} [{1}] {2}" -f $ts, $lvl, $m) -Encoding UTF8
+  } catch {}
+}
+
 function Register-CleanAgentTask {
   $taskName = 'RSD Clean Agent'
   $taskDesc = 'RSD local cleaning agent. Runs hourly; script enforces adaptive backoff schedule.'
   $ps = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
   $args = "-NoProfile -ExecutionPolicy Bypass -File `"$AgentScript`""
+  $created = $false
 
-  $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddHours(1)
-  $trigger.RepetitionInterval = (New-TimeSpan -Hours 1)
-  $trigger.RepetitionDuration = ([TimeSpan]::MaxValue)
+  # Always clear any stale task first (best effort)
+  try { schtasks /Delete /F /TN "$taskName" | Out-Null } catch {}
 
-  $action = New-ScheduledTaskAction -Execute $ps -Argument $args
-  $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 20) -MultipleInstances IgnoreNew
-  $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-  $task = New-ScheduledTask -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description $taskDesc
+  $useScheduledTasksModule = $true
+  foreach ($cmd in @('New-ScheduledTaskTrigger','New-ScheduledTaskAction','New-ScheduledTaskSettingsSet','New-ScheduledTaskPrincipal','New-ScheduledTask','Register-ScheduledTask')) {
+    if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) { $useScheduledTasksModule = $false; break }
+  }
 
+  if ($useScheduledTasksModule) {
+    try {
+      $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
+      $trigger.RepetitionInterval = (New-TimeSpan -Hours 1)
+      $trigger.RepetitionDuration = ([TimeSpan]::MaxValue)
+
+      $action = New-ScheduledTaskAction -Execute $ps -Argument $args
+      $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 20) -MultipleInstances IgnoreNew
+      $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+      $task = New-ScheduledTask -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description $taskDesc
+
+      Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
+      $created = $true
+      Remediate-Log "Registered task via ScheduledTasks module"
+    } catch {
+      Remediate-Log "ScheduledTasks registration failed; falling back to schtasks.exe" 'WARN'
+    }
+  } else {
+    Remediate-Log "ScheduledTasks cmdlets unavailable; using schtasks.exe fallback" 'WARN'
+  }
+
+  if (-not $created) {
+    try {
+      schtasks /Create /F /RU "SYSTEM" /RL HIGHEST /SC HOURLY /MO 1 /TN "$taskName" /TR "`"$ps`" $args" | Out-Null
+    } catch {}
+  }
+
+  # Verification pass and immediate run
   try {
-    $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    if ($existing) { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false | Out-Null }
+    $query = schtasks /Query /TN "$taskName" /FO LIST 2>$null
+    if ($LASTEXITCODE -eq 0) {
+      Remediate-Log "Task present after registration: $taskName"
+      try { schtasks /Run /TN "$taskName" | Out-Null } catch {}
+      return $true
+    }
   } catch {}
 
-  try {
-    Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
-  } catch {
-    schtasks /Create /F /RU SYSTEM /RL HIGHEST /SC HOURLY /MO 1 /TN "$taskName" /TR "`"$ps`" $args" | Out-Null
-  }
+  Remediate-Log "Task registration verification failed: $taskName" 'ERROR'
+  return $false
 }
 
 Ensure-Dir $AgentRoot
@@ -1562,7 +1622,8 @@ Write-FileUtf8 $TargetsPath $TargetsPayload
 Write-FileUtf8 $VersionFile $ThisVersion
 
 if (-not (Test-Path $StateFile)) {
-  $init = '{"phase":0,"phaseStart":"2026-02-27T20:42:10.010676","lastDetect":"2026-02-27T20:42:10.010681","lastRun":"2026-02-27T20:42:10.010682","lastFound":[]}'
+   $initObj = @{ phase=0; phaseStart=(Get-Date).ToString("o"); lastDetect=(Get-Date).ToString("o"); lastRun=(Get-Date).ToString("o"); lastFound=@() }
+  $init = ($initObj | ConvertTo-Json -Depth 6)
   Write-FileUtf8 $StateFile $init
 }
 
@@ -1573,8 +1634,11 @@ Set-RsdFileAcl $TargetsPath
 Set-RsdFileAcl $VersionFile
 Set-RsdFileAcl $StateFile
 
-Register-CleanAgentTask
-
-try { Start-ScheduledTask -TaskName 'RSD Clean Agent' -ErrorAction SilentlyContinue } catch {}
-
+Remediate-Log "Starting remediation deployment version $ThisVersion"
+$taskOk = Register-CleanAgentTask
+if (-not $taskOk) {
+  Remediate-Log "Remediation deployment completed with task registration failure" "ERROR"
+  exit 1
+}
+Remediate-Log "Remediation deployment complete"
 exit 0
