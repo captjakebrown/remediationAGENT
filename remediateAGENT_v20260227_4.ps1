@@ -9,6 +9,10 @@ Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'SilentlyContinue'
 
+param(
+  [string]$RunSource
+)
+
 $AgentRoot = 'C:\ProgramData\RSD\Agent'
 $AgentScript = Join-Path $AgentRoot 'cleanAGENT.ps1'
 $TargetsPath = Join-Path $AgentRoot 'targets.json'
@@ -474,10 +478,13 @@ try {
           Log -m ("No QuietUninstallString for: " + $e.DisplayName) -lvl "WARN"
         }
       }
+
+      if ($did) { $removedThisRun += $t.Name }
     }
 
     if ($did) { $removedThisRun += $t.Name }
   }
+  Log "Completed Pass 1"
 
   # Refresh & residual filesystem pass (portable/installer artifacts)
   Log "Starting post-removal UWP snapshot"
