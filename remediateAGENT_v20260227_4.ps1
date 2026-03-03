@@ -1636,12 +1636,35 @@ function Register-CleanAgentTask {
     }
   } catch {}
 
+  Import-Module ScheduledTasks -ErrorAction SilentlyContinue
+
   $useScheduledTasksModule = $true
   foreach ($cmd in @('New-ScheduledTaskTrigger','New-ScheduledTaskAction','New-ScheduledTaskSettingsSet','New-ScheduledTaskPrincipal','New-ScheduledTask','Register-ScheduledTask')) {
     if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) { $useScheduledTasksModule = $false; break }
   }
 
-  if ($useScheduledTasksModule) {
+  if (-not $useScheduledTasksModule) {
+    Remediate-Log "ScheduledTasks cmdlets unavailable after import; expected in Intune/SYSTEM context. Using schtasks.exe as primary path."
+  } else {
+    Remediate-Log "ScheduledTasks cmdlets detected after import; schtasks.exe remains primary path for reliability."
+  }
+
+  # Primary reliable path for Intune/SYSTEM contexts
+  if (-not $created) {
+    try {
+      $tr = "`\"$ps`\" -NoProfile -ExecutionPolicy Bypass -File `\"$AgentScript`\""
+      Remediate-Log ("Creating scheduled task via schtasks: " + $taskName)
+      schtasks /Create /F /RU "SYSTEM" /RL HIGHEST /SC HOURLY /MO 1 /TN "$taskName" /TR "$tr" | Out-Null
+      if ($LASTEXITCODE -eq 0) {
+        $created = $true
+        Remediate-Log "Registered task via schtasks.exe"
+      }
+    } catch {
+      Remediate-Log -m "schtasks.exe /Create threw an exception" -lvl 'ERROR'
+    }
+  }
+
+  if ((-not $created) -and $useScheduledTasksModule) {
     try {
       $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
       $trigger.RepetitionInterval = (New-TimeSpan -Hours 1)
@@ -1656,19 +1679,7 @@ function Register-CleanAgentTask {
       $created = $true
       Remediate-Log "Registered task via ScheduledTasks module"
     } catch {
-      Remediate-Log -m "ScheduledTasks registration failed; falling back to schtasks.exe" -lvl 'WARN'
-    }
-  } else {
-    Remediate-Log -m "ScheduledTasks cmdlets unavailable; using schtasks.exe fallback" -lvl 'WARN'
-  }
-
-  if (-not $created) {
-    try {
-      $tr = "`"$ps`" -NoProfile -ExecutionPolicy Bypass -File `"$AgentScript`""
-      Remediate-Log ("Creating scheduled task via schtasks: " + $taskName)
-      schtasks /Create /F /RU "SYSTEM" /RL HIGHEST /SC HOURLY /MO 1 /TN "$taskName" /TR "$tr" | Out-Null
-    } catch {
-      Remediate-Log -m "schtasks.exe /Create threw an exception" -lvl 'ERROR'
+      Remediate-Log -m "ScheduledTasks registration failed after schtasks.exe attempt" -lvl 'WARN'
     }
   }
 
