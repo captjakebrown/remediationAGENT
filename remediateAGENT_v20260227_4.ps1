@@ -1,7 +1,7 @@
 <#
 RSD CleanAgent - Intune Proactive Remediation Remediation
 PowerShell 5.1 compatible
-Version: 2026.03.02.5
+Version: 2026.03.03.1
 
 Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
 #>
@@ -19,13 +19,14 @@ $TargetsPath = Join-Path $AgentRoot 'targets.json'
 $VersionFile = Join-Path $AgentRoot 'version.txt'
 $StateFile   = Join-Path $AgentRoot 'state.json'
 $LogDir      = Join-Path $AgentRoot 'Logs'
+$KickMarker  = Join-Path $AgentRoot 'lastImmediateKick.txt'
 
-$ThisVersion = '2026.03.02.5'
+$ThisVersion = '2026.03.03.1'
 
 $AgentPayload = @'
 <#
 RSD CleanAgent (local) - PowerShell 5.1
-Version: 2026.03.02.5
+Version: 2026.03.03.1
 
 Behavior:
 - Batch inventory UWP/ARP once per run.
@@ -50,6 +51,7 @@ $AgentRoot = 'C:\ProgramData\RSD\Agent'
 $TargetsPath = Join-Path $AgentRoot 'targets.json'
 $StateFile   = Join-Path $AgentRoot 'state.json'
 $LogDir      = Join-Path $AgentRoot 'Logs'
+$KickMarker  = Join-Path $AgentRoot 'lastImmediateKick.txt'
 if (-not (Test-Path $LogDir)) { New-Item -Path $LogDir -ItemType Directory -Force | Out-Null }
 
 $logPath = Join-Path $LogDir ("cleanAGENT_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
@@ -228,14 +230,43 @@ function Snapshot-Uwp() {
   return $set
 }
 
-function Snapshot-Arp() {
+function Snapshot-Arp([int]$maxSeconds=120) {
   $list = @()
-  $paths = @(
-    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+  $bases = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
   )
-  foreach ($p in $paths) {
-    try { Get-ItemProperty -Path $p -ErrorAction SilentlyContinue | ForEach-Object { if ($_.DisplayName) { $list += $_ } } } catch {}
+
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  foreach ($base in $bases) {
+    $keys = @()
+    try { $keys = @(Get-ChildItem -Path $base -ErrorAction SilentlyContinue) } catch {}
+    $i = 0
+    foreach ($k in $keys) {
+      $i++
+      if ($sw.Elapsed.TotalSeconds -ge $maxSeconds) {
+        Log -m ("ARP snapshot timeout after " + [int]$sw.Elapsed.TotalSeconds + "s; continuing with partial results") -lvl 'WARN'
+        return $list
+      }
+
+      try {
+        $item = Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction SilentlyContinue
+        if ($item -and $item.DisplayName) {
+          $list += [PSCustomObject]@{
+            DisplayName = $item.DisplayName
+            QuietUninstallString = $item.QuietUninstallString
+            UninstallString = $item.UninstallString
+            Publisher = $item.Publisher
+            DisplayVersion = $item.DisplayVersion
+            InstallLocation = $item.InstallLocation
+          }
+        }
+      } catch {}
+
+      if (($i % 25) -eq 0) {
+        Log ("ARP snapshot progress base=" + $base + " processed=" + $i + "/" + $keys.Count)
+      }
+    }
   }
   return $list
 }
@@ -456,6 +487,7 @@ try {
   $removedThisRun = @()
 
   # Pass 1: remove UWP + quiet ARP
+  Log "Starting Pass 1 removals"
   foreach ($t in $targets) {
     $present = $false
     if ($t.UWPFamily -and $uwpSet.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $present = $true; $foundThisRun += $t.Name }
@@ -484,7 +516,7 @@ try {
 
     if ($did) { $removedThisRun += $t.Name }
   }
-  Log "Completed Pass 1"
+  Log "Completed Pass 1 removals"
 
   # Refresh & residual filesystem pass (portable/installer artifacts)
   Log "Starting post-removal UWP snapshot"
@@ -550,6 +582,7 @@ try {
   $state.lastRun = (Get-Date).ToString('o')
   Write-JsonFile $StateFile $state
 
+  Log ("RunSummary foundTargets=" + (($foundThisRun | Select-Object -Unique).Count) + " removedTargets=" + (($removedThisRun | Select-Object -Unique).Count) + " foundArtifacts=" + $foundAnyArtifacts)
   if (-not $portableVerifiedGone) {
     Log -m "Portable verification failed (some artifacts remain)." -lvl "WARN"
     $scriptExitCode = 1
@@ -1620,6 +1653,8 @@ function Remediate-Log([string]$m, [string]$lvl='INFO') {
 }
 
 function Register-CleanAgentTask {
+  $script:TaskCreatedNow = $false
+  $script:TaskAlreadyExisted = $false
   $taskName = 'RSD-CleanAGENT'
   $taskDesc = 'RSD local cleaning agent. Runs hourly; script enforces adaptive backoff schedule.'
   $ps = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -1630,41 +1665,20 @@ function Register-CleanAgentTask {
   try {
     schtasks /Query /TN "$taskName" /FO LIST | Out-Null
     if ($LASTEXITCODE -eq 0) {
+      $script:TaskAlreadyExisted = $true
       Remediate-Log ("Existing task already present: " + $taskName)
       try { schtasks /Run /TN "$taskName" | Out-Null } catch {}
       return $true
     }
   } catch {}
 
-  Import-Module ScheduledTasks -ErrorAction SilentlyContinue
-
+  try { Import-Module ScheduledTasks -ErrorAction SilentlyContinue | Out-Null } catch {}
   $useScheduledTasksModule = $true
   foreach ($cmd in @('New-ScheduledTaskTrigger','New-ScheduledTaskAction','New-ScheduledTaskSettingsSet','New-ScheduledTaskPrincipal','New-ScheduledTask','Register-ScheduledTask')) {
     if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) { $useScheduledTasksModule = $false; break }
   }
 
-  if (-not $useScheduledTasksModule) {
-    Remediate-Log "ScheduledTasks cmdlets unavailable after import; expected in Intune/SYSTEM context. Using schtasks.exe as primary path."
-  } else {
-    Remediate-Log "ScheduledTasks cmdlets detected after import; schtasks.exe remains primary path for reliability."
-  }
-
-  # Primary reliable path for Intune/SYSTEM contexts
-  if (-not $created) {
-    try {
-      $tr = "`\"$ps`\" -NoProfile -ExecutionPolicy Bypass -File `\"$AgentScript`\""
-      Remediate-Log ("Creating scheduled task via schtasks: " + $taskName)
-      schtasks /Create /F /RU "SYSTEM" /RL HIGHEST /SC HOURLY /MO 1 /TN "$taskName" /TR "$tr" | Out-Null
-      if ($LASTEXITCODE -eq 0) {
-        $created = $true
-        Remediate-Log "Registered task via schtasks.exe"
-      }
-    } catch {
-      Remediate-Log -m "schtasks.exe /Create threw an exception" -lvl 'ERROR'
-    }
-  }
-
-  if ((-not $created) -and $useScheduledTasksModule) {
+  if ($useScheduledTasksModule) {
     try {
       $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
       $trigger.RepetitionInterval = (New-TimeSpan -Hours 1)
@@ -1677,9 +1691,23 @@ function Register-CleanAgentTask {
 
       Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
       $created = $true
+      $script:TaskCreatedNow = $true
       Remediate-Log "Registered task via ScheduledTasks module"
     } catch {
-      Remediate-Log -m "ScheduledTasks registration failed after schtasks.exe attempt" -lvl 'WARN'
+      Remediate-Log -m ("ScheduledTasks registration failed; falling back to schtasks.exe. " + $_.Exception.Message) -lvl 'INFO'
+    }
+  } else {
+    Remediate-Log -m "ScheduledTasks cmdlets unavailable in this context; using schtasks.exe fallback" -lvl 'INFO'
+  }
+
+  if (-not $created) {
+    try {
+      $tr = "`"$ps`" -NoProfile -ExecutionPolicy Bypass -File `"$AgentScript`""
+      Remediate-Log ("Creating scheduled task via schtasks: " + $taskName)
+      schtasks /Create /F /RU "SYSTEM" /RL HIGHEST /SC HOURLY /MO 1 /TN "$taskName" /TR "$tr" | Out-Null
+      if ($LASTEXITCODE -eq 0) { $script:TaskCreatedNow = $true }
+    } catch {
+      Remediate-Log -m "schtasks.exe /Create threw an exception" -lvl 'ERROR'
     }
   }
 
@@ -1721,7 +1749,7 @@ function Invoke-CleanAgentNow {
     $p = Start-Process -FilePath $ps -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$AgentScript`"" -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
     if ($p) {
       $done = $p.WaitForExit(600000)
-      if ($done) { Remediate-Log ("Immediate cleanAGENT run finished with exit code " + $p.ExitCode) }
+      if ($done) { Remediate-Log ("Immediate cleanAGENT run finished with exit code " + $p.ExitCode); try { Set-Content -Path $KickMarker -Value (Get-Date).ToString("o") -Encoding UTF8 } catch {} }
       else {
         try { $p.Kill() } catch {}
         Remediate-Log -m "Immediate cleanAGENT run timed out after 10 minutes" -lvl 'WARN'
@@ -1764,6 +1792,20 @@ if (-not $taskOk) {
   exit 1
 }
 try { Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue } catch {}
-Invoke-CleanAgentNow
+$shouldKickNow = $false
+if ($script:TaskCreatedNow) { $shouldKickNow = $true }
+elseif (-not (Test-Path $KickMarker)) { $shouldKickNow = $true }
+else {
+  try {
+    $lastKick = Get-Date (Get-Content -Path $KickMarker -Raw -ErrorAction SilentlyContinue)
+    $mins = (New-TimeSpan -Start $lastKick -End (Get-Date)).TotalMinutes
+    if ($mins -ge 60) { $shouldKickNow = $true }
+  } catch { $shouldKickNow = $true }
+}
+if ($shouldKickNow) {
+  Invoke-CleanAgentNow
+} else {
+  Remediate-Log "Skipping immediate cleanAGENT kick (recent run marker present)"
+}
 Remediate-Log "Remediation deployment complete"
 exit 0
