@@ -1652,7 +1652,7 @@ function Register-CleanAgentTask {
   # Primary reliable path for Intune/SYSTEM contexts
   if (-not $created) {
     try {
-      $tr = "`\"$ps`\" -NoProfile -ExecutionPolicy Bypass -File `\"$AgentScript`\""
+      $tr = "`"$ps`" -NoProfile -ExecutionPolicy Bypass -File `"$AgentScript`""
       Remediate-Log ("Creating scheduled task via schtasks: " + $taskName)
       schtasks /Create /F /RU "SYSTEM" /RL HIGHEST /SC HOURLY /MO 1 /TN "$taskName" /TR "$tr" | Out-Null
       if ($LASTEXITCODE -eq 0) {
