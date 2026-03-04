@@ -245,6 +245,15 @@ function Match-Arp($arpList, $pattern) {
   return @($arpList | Where-Object { $_.DisplayName -like $pattern })
 }
 
+function Get-TargetValue($target, [string]$name) {
+  if (-not $target -or -not $name) { return $null }
+  try {
+    $prop = $target.PSObject.Properties[$name]
+    if ($prop) { return $prop.Value }
+  } catch {}
+  return $null
+}
+
 function Remove-UwpFamily($family) {
   if (-not $family) { return $false }
   $removed = $false
@@ -457,18 +466,23 @@ try {
 
   # Pass 1: remove UWP + quiet ARP
   foreach ($t in $targets) {
+    $tName = Get-TargetValue $t 'Name'
+    if (-not $tName) { $tName = '<unnamed-target>' }
+    $tUwpFamily = Get-TargetValue $t 'UWPFamily'
+    $tArpName = Get-TargetValue $t 'ARPName'
+
     $present = $false
-    if ($t.UWPFamily -and $uwpSet.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $present = $true; $foundThisRun += $t.Name }
-    if (-not $present -and $t.ARPName) {
-      if ((Match-Arp $arpList $t.ARPName).Count -gt 0) { $present = $true; $foundThisRun += $t.Name }
+    if ($tUwpFamily -and $uwpSet.ContainsKey($tUwpFamily.ToLowerInvariant())) { $present = $true; $foundThisRun += $tName }
+    if (-not $present -and $tArpName) {
+      if ((Match-Arp $arpList $tArpName).Count -gt 0) { $present = $true; $foundThisRun += $tName }
     }
     if (-not $present) { continue }
 
     $did = $false
-    if ($t.UWPFamily) { $did = (Remove-UwpFamily $t.UWPFamily) -or $did }
+    if ($tUwpFamily) { $did = (Remove-UwpFamily $tUwpFamily) -or $did }
 
-    if ($t.ARPName) {
-      $matches = Match-Arp $arpList $t.ARPName
+    if ($tArpName) {
+      $matches = Match-Arp $arpList $tArpName
       foreach ($e in $matches) {
         if ($e.QuietUninstallString) {
           Log ("Quiet uninstall ARP: " + $e.DisplayName)
@@ -479,10 +493,10 @@ try {
         }
       }
 
-      if ($did) { $removedThisRun += $t.Name }
+      if ($did) { $removedThisRun += $tName }
     }
 
-    if ($did) { $removedThisRun += $t.Name }
+    if ($did) { $removedThisRun += $tName }
   }
   Log "Completed Pass 1"
 
@@ -499,10 +513,15 @@ try {
 
   $residual = @()
   foreach ($t in $targets) {
+    $tUwpFamily = Get-TargetValue $t 'UWPFamily'
+    $tArpName = Get-TargetValue $t 'ARPName'
+    $tPortable = Get-TargetValue $t 'PortableExeSignatures'
+    $tInstaller = Get-TargetValue $t 'InstallerSignatures'
+
     $still = $false
-    if ($t.UWPFamily -and $uwpSet2.ContainsKey($t.UWPFamily.ToLowerInvariant())) { $still = $true }
-    if (-not $still -and $t.ARPName) { if ((Match-Arp $arpList2 $t.ARPName).Count -gt 0) { $still = $true } }
-    if ($still -or $t.PortableExeSignatures -or $t.InstallerSignatures) { $residual += $t }
+    if ($tUwpFamily -and $uwpSet2.ContainsKey($tUwpFamily.ToLowerInvariant())) { $still = $true }
+    if (-not $still -and $tArpName) { if ((Match-Arp $arpList2 $tArpName).Count -gt 0) { $still = $true } }
+    if ($still -or $tPortable -or $tInstaller) { $residual += $t }
   }
 
   $roots = @()
@@ -525,14 +544,20 @@ try {
     if (-not $stems -or $stems.Count -eq 0) { continue }
     if ($activeUser) {
       $shortcutRemoved = Remove-QuickLaunchMatches $activeUser $stems
-      if ($shortcutRemoved) { $removedThisRun += $t.Name }
+      if ($shortcutRemoved) {
+        $tName = Get-TargetValue $t 'Name'
+        if (-not $tName) { $tName = '<unnamed-target>' }
+        $removedThisRun += $tName
+      }
     }
     $hits = Find-MatchingFiles $fileIndex $stems
     if ($hits.Count -gt 0) {
       $foundAnyArtifacts = $true
-      Log ("Removing artifacts for " + $t.Name + " hits=" + $hits.Count)
+      $tName = Get-TargetValue $t 'Name'
+      if (-not $tName) { $tName = '<unnamed-target>' }
+      Log ("Removing artifacts for " + $tName + " hits=" + $hits.Count)
       Remove-Paths $hits
-      $removedThisRun += $t.Name
+      $removedThisRun += $tName
       foreach ($p in $hits) { if (Test-Path $p) { $portableVerifiedGone = $false } }
     }
   }
@@ -554,6 +579,11 @@ try {
     Log -m "Portable verification failed (some artifacts remain)." -lvl "WARN"
     $scriptExitCode = 1
   }
+}
+catch {
+  $scriptExitCode = 1
+  $errText = $_ | Out-String
+  Log -m ("Unhandled exception in cleanAGENT main: " + $errText.Trim()) -lvl "ERROR"
 }
 finally {
   if ($mutexOwned -and $mutex) {
@@ -1631,7 +1661,6 @@ function Register-CleanAgentTask {
     schtasks /Query /TN "$taskName" /FO LIST | Out-Null
     if ($LASTEXITCODE -eq 0) {
       Remediate-Log ("Existing task already present: " + $taskName)
-      try { schtasks /Run /TN "$taskName" | Out-Null } catch {}
       return $true
     }
   } catch {}
@@ -1683,7 +1712,7 @@ function Register-CleanAgentTask {
     }
   }
 
-  # Exact verification pass and immediate run
+  # Exact verification pass
   try {
     schtasks /Query /TN "$taskName" /FO LIST | Out-Null
     if ($LASTEXITCODE -eq 0) {
@@ -1702,7 +1731,6 @@ function Register-CleanAgentTask {
           }
         }
       }
-      try { schtasks /Run /TN "$taskName" | Out-Null } catch {}
       return $true
     }
 
@@ -1763,7 +1791,6 @@ if (-not $taskOk) {
   Remediate-Log -m "Remediation deployment completed with task registration failure" -lvl "ERROR"
   exit 1
 }
-try { Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue } catch {}
 Invoke-CleanAgentNow
 Remediate-Log "Remediation deployment complete"
 exit 0
