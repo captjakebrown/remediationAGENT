@@ -506,6 +506,42 @@ function Union-StringArrays {
   return @($out)
 }
 
+
+function Get-IdentityKey {
+  param($Identity)
+
+  if (-not $Identity) { return $null }
+
+  $src = $null
+  try { $src = $Identity.SourcePath } catch { $src = $null }
+  if ($src) { return ('src:' + $src.ToString().ToLowerInvariant()) }
+
+  $parts = @()
+  foreach ($p in @('FileName','OriginalFilename','ProductName','CompanyName','CertThumbprint')) {
+    $v = $null
+    try { $v = $Identity.$p } catch { $v = $null }
+    if ($v) { $parts += $v.ToString().ToLowerInvariant() } else { $parts += '' }
+  }
+  return ('meta:' + ($parts -join '|'))
+}
+
+function Get-UniqueIdentities {
+  param([object[]]$Identities)
+
+  if (-not $Identities) { return @() }
+  $seen = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+  $out  = New-Object System.Collections.Generic.List[object]
+
+  foreach ($id in $Identities) {
+    if (-not $id) { continue }
+    $k = Get-IdentityKey $id
+    if (-not $k) { continue }
+    if ($seen.Add($k)) { [void]$out.Add($id) }
+  }
+
+  return @($out.ToArray())
+}
+
 function Get-AuthenticodeInfo {
   param([string]$Path)
   try {
@@ -546,6 +582,7 @@ function Get-FileIdentityBasic {
       IsSigned         = $sig.IsSigned
       CertThumbprint   = $sig.CertThumbprint
       SignerSimpleName = $sig.SignerSimple
+      SourcePath       = $Path
     }
   } catch { $null }
 }
@@ -2586,9 +2623,9 @@ $ScanRoots = @(
   (Join-Path $profilePath 'AppData\Local'),
   (Join-Path $profilePath 'AppData\Roaming'),
   (Join-Path $profilePath 'AppData\Local\Programs'),
+  # AppData\Local\Temp includes browser staging directories such as
+  # MicrosoftEdgeDownloads and Google\Chrome.
   (Join-Path $profilePath 'AppData\Local\Temp'),
-  (Join-Path $profilePath 'AppData\Local\Temp\MicrosoftEdgeDownloads'),
-  (Join-Path $profilePath 'AppData\Local\Temp\Google\Chrome'),
   (Join-Path $profilePath 'Downloads'),
   (Join-Path $profilePath 'Documents'),
   (Join-Path $profilePath 'Desktop')
@@ -2859,6 +2896,7 @@ if ($true) { # always run installer scan; deep portable scanning gating handled 
   $nameTokens = Get-NameTokens $AppName
   $useNameTokens = Is-StrongTokenSet $nameTokens
   $idsMatched = @()
+  $seenInstallerPaths = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
   # Collect directories to search for candidate installer executables.  We focus on
   # locations where a user would typically download setup files: the Desktop,
   # Downloads, and Documents folders.  We intentionally do *not* include
@@ -2872,9 +2910,7 @@ if ($true) { # always run installer scan; deep portable scanning gating handled 
     (Join-Path $profilePath 'Downloads'),
     (Join-Path $profilePath 'Documents'),
     (Join-Path $profilePath 'Desktop'),
-    (Join-Path $profilePath 'AppData\Local\Temp'),
-    (Join-Path $profilePath 'AppData\Local\Temp\MicrosoftEdgeDownloads'),
-    (Join-Path $profilePath 'AppData\Local\Temp\Google\Chrome')
+    (Join-Path $profilePath 'AppData\Local\Temp')
   )
   # Do not include InstallLocation paths from ARP entries when searching
   # for installers.  These paths often lead to helper executables such as
@@ -2891,6 +2927,7 @@ if ($true) { # always run installer scan; deep portable scanning gating handled 
       # Skip known excluded locations such as C:\Recovery and
       # Downloads\Recovery Drives.
       if (Test-IsExcludedScanPath -Path $file.FullName) { continue }
+      if (-not $seenInstallerPaths.Add($file.FullName)) { continue }
       $leaf = (Split-Path $file.FullName -Leaf)
       $isInstallerish = ($leaf -match $installerNamePattern)
       $isNameHit      = ($useNameTokens -and (Matches-OrderedTokens -text $leaf -tokens $nameTokens))
@@ -3058,6 +3095,7 @@ $hasArpOrUwp = ($arpHits.Count -gt 0 -or $uwpHits.Count -gt 0)
 
 # Filter out generic Microsoft installers that do not strongly match the app name.
 if ($idsMatched.Count -gt 0) {
+  $idsMatched = Get-UniqueIdentities $idsMatched
   # Remove generic Microsoft entries unless they strongly match the search tokens.
   $idsMatched = @($idsMatched | Where-Object {
     $id = $_
@@ -3405,6 +3443,7 @@ if ($isPortableCandidate) {
   }
 
   if ($portableInputs.Count -gt 0) {
+    $portableInputs = Get-UniqueIdentities $portableInputs
     $PortableExeSignatures = Build-InstallerSignature $portableInputs
 
     if ($PortableExeSignatures -and $PrimaryExeIdentity -and $PrimaryExeIdentity.FileName) {
