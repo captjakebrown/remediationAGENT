@@ -1,7 +1,7 @@
 <#
 RSD CleanAgent - Intune Proactive Remediation Remediation
 PowerShell 5.1 compatible
-Version: 2026.03.02.5
+Version: 2026.03.04.1
 
 Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
 #>
@@ -20,12 +20,12 @@ $VersionFile = Join-Path $AgentRoot 'version.txt'
 $StateFile   = Join-Path $AgentRoot 'state.json'
 $LogDir      = Join-Path $AgentRoot 'Logs'
 
-$ThisVersion = '2026.03.02.5'
+$ThisVersion = '2026.03.04.1'
 
 $AgentPayload = @'
 <#
 RSD CleanAgent (local) - PowerShell 5.1
-Version: 2026.03.02.5
+Version: 2026.03.04.1
 
 Behavior:
 - Batch inventory UWP/ARP once per run.
@@ -474,7 +474,8 @@ try {
     $present = $false
     if ($tUwpFamily -and $uwpSet.ContainsKey($tUwpFamily.ToLowerInvariant())) { $present = $true; $foundThisRun += $tName }
     if (-not $present -and $tArpName) {
-      if ((Match-Arp $arpList $tArpName).Count -gt 0) { $present = $true; $foundThisRun += $tName }
+      $arpMatches = @(Match-Arp $arpList $tArpName)
+      if ($arpMatches.Length -gt 0) { $present = $true; $foundThisRun += $tName }
     }
     if (-not $present) { continue }
 
@@ -520,7 +521,10 @@ try {
 
     $still = $false
     if ($tUwpFamily -and $uwpSet2.ContainsKey($tUwpFamily.ToLowerInvariant())) { $still = $true }
-    if (-not $still -and $tArpName) { if ((Match-Arp $arpList2 $tArpName).Count -gt 0) { $still = $true } }
+    if (-not $still -and $tArpName) {
+      $arpMatches2 = @(Match-Arp $arpList2 $tArpName)
+      if ($arpMatches2.Length -gt 0) { $still = $true }
+    }
     if ($still -or $tPortable -or $tInstaller) { $residual += $t }
   }
 
