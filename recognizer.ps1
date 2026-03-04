@@ -1720,9 +1720,11 @@ function Find-DirsForName {
   if (-not (Is-StrongTokenSet $tokens)) { return @() }
   foreach ($root in $roots) {
     if (-not (Test-Path $root)) { continue }
+    if (Test-IsExcludedScanPath -Path $root) { continue }
     try {
       $candidates = Get-ChildItem -Path $root -Directory -Recurse -ErrorAction SilentlyContinue
       foreach ($d in $candidates) {
+        if (Test-IsExcludedScanPath -Path $d.FullName) { continue }
         $leaf = $d.Name
         if ($leaf -and (Matches-OrderedTokens -text $leaf -tokens $tokens)) {
           $dirs.Add($d.FullName) | Out-Null
@@ -1743,6 +1745,136 @@ function Find-DirsForName {
     if (-not $isChild) { $top.Add($h) | Out-Null }
   }
   @($top.ToArray())
+}
+
+function Test-IsExcludedScanPath {
+  param([string]$Path)
+
+  if (-not $Path) { return $false }
+  $normalized = $Path.ToLowerInvariant()
+
+  # Explicitly skip the Windows recovery root.
+  if ($normalized -eq 'c:\recovery' -or $normalized.StartsWith('c:\recovery\')) {
+    return $true
+  }
+
+  # Skip "Recovery Drives" content under user Downloads folders.
+  if ($normalized -match '\\downloads\\recovery drives(\\|$)') {
+    return $true
+  }
+
+  return $false
+}
+
+
+function Test-CanPromptUser {
+  try {
+    if (-not [Environment]::UserInteractive) { return $false }
+    if ([Console]::IsInputRedirected) { return $false }
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function Get-ComparableNameKey {
+  param([string]$Name)
+
+  if (-not $Name) { return '' }
+  $n = $Name.ToLowerInvariant()
+  # Remove explicit version fragments such as 1.2.3, v15, _2024 and similar.
+  $n = [regex]::Replace($n, '(?i)\bv?\d+(?:[\._-]\d+)+\b', ' ')
+  $n = [regex]::Replace($n, '(?i)\bv\d+\b', ' ')
+  $n = [regex]::Replace($n, '(?i)\b\d{4}\b', ' ')
+  # Normalize punctuation and whitespace.
+  $n = [regex]::Replace($n, '[^a-z0-9]+', ' ')
+  $n = [regex]::Replace($n, '\s+', ' ').Trim()
+  return $n
+}
+
+function Select-ArpCandidateInteractive {
+  param(
+    [Parameter(Mandatory=$true)]$Candidates,
+    $Recommended
+  )
+
+  $result = [pscustomobject]@{ Selected = $Recommended; Aborted = $false }
+  if (-not $Candidates -or $Candidates.Count -le 1) { return $result }
+  if (-not (Test-CanPromptUser)) { return $result }
+
+  Write-Host ''
+  Write-Host 'Multiple ARP matches were found. Choose which one to target:' -ForegroundColor Cyan
+
+  for ($i = 0; $i -lt $Candidates.Count; $i++) {
+    $c = $Candidates[$i]
+    $dn = if ($c.DisplayName) { $c.DisplayName } else { $c.KeyName }
+    $ver = if ($c.DisplayVersion) { $c.DisplayVersion } else { '-' }
+    $pub = if ($c.Publisher) { $c.Publisher } else { '-' }
+    $recMark = ''
+    if ($Recommended -and ($c.KeyName -eq $Recommended.KeyName) -and ($c.HivePath -eq $Recommended.HivePath)) { $recMark = ' [recommended]' }
+    Write-Host ("  [{0}] {1} | Version: {2} | Publisher: {3}{4}" -f ($i+1), $dn, $ver, $pub, $recMark)
+  }
+  Write-Host '  [0] Abort (no selection; adjust search parameters)'
+
+  while ($true) {
+    $raw = Read-Host 'Select ARP entry number (Enter keeps recommended)'
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $result }
+    $num = 0
+    if (-not [int]::TryParse($raw, [ref]$num)) {
+      Write-Host 'Invalid input. Enter a number from the list.' -ForegroundColor DarkYellow
+      continue
+    }
+    if ($num -eq 0) {
+      $result.Aborted = $true
+      return $result
+    }
+    if ($num -ge 1 -and $num -le $Candidates.Count) {
+      $result.Selected = $Candidates[$num - 1]
+      return $result
+    }
+    Write-Host 'Selection out of range. Try again.' -ForegroundColor DarkYellow
+  }
+}
+
+function Select-UwpCandidateInteractive {
+  param([Parameter(Mandatory=$true)]$Candidates)
+
+  $result = [pscustomobject]@{ Selected = $null; Aborted = $false }
+  if (-not $Candidates -or $Candidates.Count -le 1) {
+    $result.Selected = if ($Candidates -and $Candidates.Count -gt 0) { $Candidates[0] } else { $null }
+    return $result
+  }
+  if (-not (Test-CanPromptUser)) {
+    $result.Selected = $Candidates[0]
+    return $result
+  }
+
+  Write-Host ''
+  Write-Host 'Multiple UWP matches were found. Choose which one to target:' -ForegroundColor Cyan
+  for ($i = 0; $i -lt $Candidates.Count; $i++) {
+    $u = $Candidates[$i]
+    $nm = if ($u.Name) { $u.Name } elseif ($u.RegistryDisplayName) { $u.RegistryDisplayName } else { $u.PackageFamilyName }
+    Write-Host ("  [{0}] {1} | PFN: {2}" -f ($i+1), $nm, $u.PackageFamilyName)
+  }
+  Write-Host '  [0] Abort (no selection; adjust search parameters)'
+
+  while ($true) {
+    $raw = Read-Host 'Select UWP entry number'
+    $num = 0
+    if (-not [int]::TryParse($raw, [ref]$num)) {
+      Write-Host 'Invalid input. Enter a number from the list.' -ForegroundColor DarkYellow
+      continue
+    }
+    if ($num -eq 0) {
+      $result.Aborted = $true
+      return $result
+    }
+    if ($num -ge 1 -and $num -le $Candidates.Count) {
+      $result.Selected = $Candidates[$num - 1]
+      return $result
+    }
+    Write-Host 'Selection out of range. Try again.' -ForegroundColor DarkYellow
+  }
 }
 
 function Is-GenericProductName {
@@ -2259,6 +2391,27 @@ if ($arpHits.Count -gt 0) {
     }
   }
 
+  # If multiple ARP entries are present and they differ by more than version-like
+  # text, prompt the operator to select which package should drive the search.
+  if ($arpHits.Count -gt 1) {
+    $arpComparable = @{}
+    foreach ($a in $arpHits) {
+      $dnA = if ($a.DisplayName) { $a.DisplayName } else { $a.KeyName }
+      $k = Get-ComparableNameKey $dnA
+      if (-not $arpComparable.ContainsKey($k)) { $arpComparable[$k] = $true }
+    }
+
+    if ($arpComparable.Keys.Count -gt 1) {
+      $arpChoice = Select-ArpCandidateInteractive -Candidates $arpHits -Recommended $bestArp
+      if ($arpChoice.Aborted) {
+        Write-Host 'Selection aborted by user. No changes were recorded.' -ForegroundColor Yellow
+        Write-Host '=== Recognizer done ==='
+        exit 0
+      }
+      if ($arpChoice.Selected) { $bestArp = $arpChoice.Selected }
+    }
+  }
+
   if ($bestArp) {
     $chosenDn   = if ($bestArp.DisplayName) { $bestArp.DisplayName } else { $bestArp.KeyName }
     $chosenBase = $null
@@ -2394,6 +2547,29 @@ if (($arpHits.Count -eq 0) -and ($uwpHits.Count -eq 0)) {
   }
 }
 
+# If multiple UWP packages were matched and they are not simply version variants,
+# allow an operator to explicitly choose which package to keep.
+if ($uwpHits.Count -gt 1) {
+  $uwpComparable = @{}
+  foreach ($uCand in $uwpHits) {
+    $nCand = if ($uCand.Name) { $uCand.Name } elseif ($uCand.RegistryDisplayName) { $uCand.RegistryDisplayName } else { $uCand.PackageFamilyName }
+    $kCand = Get-ComparableNameKey $nCand
+    if (-not $uwpComparable.ContainsKey($kCand)) { $uwpComparable[$kCand] = $true }
+  }
+
+  if ($uwpComparable.Keys.Count -gt 1) {
+    $uwpChoice = Select-UwpCandidateInteractive -Candidates $uwpHits
+    if ($uwpChoice.Aborted) {
+      Write-Host 'Selection aborted by user. No changes were recorded.' -ForegroundColor Yellow
+      Write-Host '=== Recognizer done ==='
+      exit 0
+    }
+    if ($uwpChoice.Selected) {
+      $uwpHits = @($uwpChoice.Selected)
+    }
+  }
+}
+
 if ($uwpHits.Count -gt 0) {
   foreach ($u in $uwpHits) {
     Write-Host "UWP: $($u.Name) | PFN: $($u.PackageFamilyName)" -ForegroundColor Yellow
@@ -2410,6 +2586,9 @@ $ScanRoots = @(
   (Join-Path $profilePath 'AppData\Local'),
   (Join-Path $profilePath 'AppData\Roaming'),
   (Join-Path $profilePath 'AppData\Local\Programs'),
+  (Join-Path $profilePath 'AppData\Local\Temp'),
+  (Join-Path $profilePath 'AppData\Local\Temp\MicrosoftEdgeDownloads'),
+  (Join-Path $profilePath 'AppData\Local\Temp\Google\Chrome'),
   (Join-Path $profilePath 'Downloads'),
   (Join-Path $profilePath 'Documents'),
   (Join-Path $profilePath 'Desktop')
@@ -2480,7 +2659,7 @@ try {
       ForEach-Object { $ScanRoots += $_.FullName }
   }
 } catch {}
-$ScanRoots = $ScanRoots | Where-Object { $_ -and (Test-Path $_) } | Sort-Object -Unique
+$ScanRoots = $ScanRoots | Where-Object { $_ -and (Test-Path $_) -and (-not (Test-IsExcludedScanPath -Path $_)) } | Sort-Object -Unique
 
 $dirHitsList = New-Object System.Collections.Generic.List[string]
 $initialDirs = Find-DirsForName -name $AppName -roots $ScanRoots
@@ -2692,25 +2871,26 @@ if ($true) { # always run installer scan; deep portable scanning gating handled 
     'C:\Users\Public\Desktop',
     (Join-Path $profilePath 'Downloads'),
     (Join-Path $profilePath 'Documents'),
-    (Join-Path $profilePath 'Desktop')
+    (Join-Path $profilePath 'Desktop'),
+    (Join-Path $profilePath 'AppData\Local\Temp'),
+    (Join-Path $profilePath 'AppData\Local\Temp\MicrosoftEdgeDownloads'),
+    (Join-Path $profilePath 'AppData\Local\Temp\Google\Chrome')
   )
   # Do not include InstallLocation paths from ARP entries when searching
   # for installers.  These paths often lead to helper executables such as
   # embedded auto-updaters or assistant installers within the application
   # directory.  Searching only in user-centric locations reduces noise and
   # improves installer detection.
-  $exeRoots = $exeRoots | Where-Object { $_ -and (Test-Path $_) } | Sort-Object -Unique
+  $exeRoots = $exeRoots | Where-Object { $_ -and (Test-Path $_) -and (-not (Test-IsExcludedScanPath -Path $_)) } | Sort-Object -Unique
 
   foreach ($root in $exeRoots) {
     $exeFiles = @()
     try { $exeFiles += Get-ChildItem -Path $root -Filter *.exe -File -Recurse -ErrorAction SilentlyContinue } catch {}
     try { $exeFiles += Get-ChildItem -Path $root -Filter *.msi -File -Recurse -ErrorAction SilentlyContinue } catch {}
     foreach ($file in $exeFiles) {
-      # Skip any executables located within a "Recovery Drives" folder inside Downloads.
-      # These directories often contain OS recovery media and scanning them for
-      # installers adds considerable overhead without yielding relevant results.
-      $fullPathLower = $file.FullName.ToLowerInvariant()
-      if ($fullPathLower -like '*\recovery drives\*') { continue }
+      # Skip known excluded locations such as C:\Recovery and
+      # Downloads\Recovery Drives.
+      if (Test-IsExcludedScanPath -Path $file.FullName) { continue }
       $leaf = (Split-Path $file.FullName -Leaf)
       $isInstallerish = ($leaf -match $installerNamePattern)
       $isNameHit      = ($useNameTokens -and (Matches-OrderedTokens -text $leaf -tokens $nameTokens))
