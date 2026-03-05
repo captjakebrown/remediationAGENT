@@ -1,7 +1,7 @@
 <#
 RSD CleanAgent - Intune Proactive Remediation Remediation
 PowerShell 5.1 compatible
-Version: 2026.03.05.1
+Version: 2026.03.05.2
 
 Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
 #>
@@ -20,12 +20,12 @@ $VersionFile = Join-Path $AgentRoot 'version.txt'
 $StateFile   = Join-Path $AgentRoot 'state.json'
 $LogDir      = Join-Path $AgentRoot 'Logs'
 
-$ThisVersion = '2026.03.05.1'
+$ThisVersion = '2026.03.05.2'
 
 $AgentPayload = @'
 <#
 RSD CleanAgent (local) - PowerShell 5.1
-Version: 2026.03.05.1
+Version: 2026.03.05.2
 
 Behavior:
 - Batch inventory UWP/ARP once per run.
@@ -319,14 +319,23 @@ function Get-ShallowCDrives() {
   return $out
 }
 
+function Get-SignatureValue($signature, [string]$name) {
+  if (-not $signature -or -not $name) { return $null }
+  try {
+    $prop = $signature.PSObject.Properties[$name]
+    if ($prop) { return $prop.Value }
+  } catch {}
+  return $null
+}
+
 function Build-Stems($t) {
   $stems = New-Object System.Collections.Generic.List[string]
   foreach ($sig in @($t.PortableExeSignatures, $t.InstallerSignatures)) {
     if (-not $sig) { continue }
-    $pn = $sig.ProductName
-    $of = $sig.OriginalFilename
-    $ifn = $sig.InstallerFileName
-    $ipath = $sig.InstallerPath
+    $pn = Get-SignatureValue $sig 'ProductName'
+    $of = Get-SignatureValue $sig 'OriginalFilename'
+    $ifn = Get-SignatureValue $sig 'InstallerFileName'
+    $ipath = Get-SignatureValue $sig 'InstallerPath'
 
     foreach ($candidate in @($pn, $of, $ifn, $ipath)) {
       if (-not $candidate) { continue }
@@ -351,7 +360,7 @@ function Get-InstallerPathCandidates($t) {
   $paths = New-Object System.Collections.Generic.List[string]
   foreach ($sig in @($t.PortableExeSignatures, $t.InstallerSignatures)) {
     if (-not $sig) { continue }
-    $p = $sig.InstallerPath
+    $p = Get-SignatureValue $sig "InstallerPath"
     if (-not $p) { continue }
     if ($p -is [System.Array]) {
       foreach ($one in $p) { if ($one) { $paths.Add([string]$one) } }
