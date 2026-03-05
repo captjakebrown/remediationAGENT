@@ -1,7 +1,7 @@
 <#
 RSD CleanAgent - Intune Proactive Remediation Remediation
 PowerShell 5.1 compatible
-Version: 2026.03.05.2
+Version: 2026.03.05.3
 
 Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
 #>
@@ -20,12 +20,12 @@ $VersionFile = Join-Path $AgentRoot 'version.txt'
 $StateFile   = Join-Path $AgentRoot 'state.json'
 $LogDir      = Join-Path $AgentRoot 'Logs'
 
-$ThisVersion = '2026.03.05.2'
+$ThisVersion = '2026.03.05.3'
 
 $AgentPayload = @'
 <#
 RSD CleanAgent (local) - PowerShell 5.1
-Version: 2026.03.05.2
+Version: 2026.03.05.3
 
 Behavior:
 - Batch inventory UWP/ARP once per run.
@@ -600,8 +600,8 @@ try {
         $removedThisRun += $tName
       }
     }
-    $hits = Find-MatchingFiles $fileIndex $stems
-    if ($hits.Count -gt 0) {
+    $hits = @(Find-MatchingFiles $fileIndex $stems)
+    if ($hits.Length -gt 0) {
       $foundAnyArtifacts = $true
       Log ("Removing artifacts for " + $tName + " hits=" + $hits.Count)
       Remove-Paths $hits
@@ -610,8 +610,8 @@ try {
     }
   }
 
-  $foundAny = ($foundThisRun | Select-Object -Unique)
-  if ($foundAny.Count -gt 0 -or $foundAnyArtifacts) {
+  $foundAny = @($foundThisRun | Select-Object -Unique)
+  if ($foundAny.Length -gt 0 -or $foundAnyArtifacts) {
     $state = Reset-Phase $state
     $state.lastDetect = (Get-Date).ToString('o')
     $state.lastFound = $foundAny
