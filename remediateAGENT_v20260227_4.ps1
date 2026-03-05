@@ -1,7 +1,7 @@
 <#
 RSD CleanAgent - Intune Proactive Remediation Remediation
 PowerShell 5.1 compatible
-Version: 2026.03.05.3
+Version: 2026.03.05.4
 
 Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
 #>
@@ -20,12 +20,12 @@ $VersionFile = Join-Path $AgentRoot 'version.txt'
 $StateFile   = Join-Path $AgentRoot 'state.json'
 $LogDir      = Join-Path $AgentRoot 'Logs'
 
-$ThisVersion = '2026.03.05.3'
+$ThisVersion = '2026.03.05.4'
 
 $AgentPayload = @'
 <#
 RSD CleanAgent (local) - PowerShell 5.1
-Version: 2026.03.05.3
+Version: 2026.03.05.4
 
 Behavior:
 - Batch inventory UWP/ARP once per run.
@@ -194,7 +194,8 @@ function Ensure-ReceiptAcl([string]$p) {
 }
 
 function Update-Receipt([string[]]$removedApps) {
-  if (-not $removedApps -or $removedApps.Count -eq 0) { return }
+  $removedApps = @($removedApps)
+  if ($removedApps.Length -eq 0) { return }
   $user = Get-ActiveUser
   $desk = Get-DesktopPathForUser $user
   if (-not $desk) { return }
@@ -352,7 +353,23 @@ function Build-Stems($t) {
       }
     }
   }
-  return ($stems | Where-Object { $_ -and $_.Length -ge 4 } | Select-Object -Unique | Select-Object -First 10)
+  return @($stems | Where-Object { $_ -and $_.Length -ge 4 } | Select-Object -Unique | Select-Object -First 10)
+}
+
+
+function Get-InstallerPathCandidates($t) {
+  $paths = New-Object System.Collections.Generic.List[string]
+  foreach ($sig in @($t.PortableExeSignatures, $t.InstallerSignatures)) {
+    if (-not $sig) { continue }
+    $p = Get-SignatureValue $sig "InstallerPath"
+    if (-not $p) { continue }
+    if ($p -is [System.Array]) {
+      foreach ($one in $p) { if ($one) { $paths.Add([string]$one) } }
+    } else {
+      $paths.Add([string]$p)
+    }
+  }
+  return @($paths | Where-Object { $_ } | Select-Object -Unique)
 }
 
 
@@ -404,7 +421,8 @@ function Index-Files($roots, $maxDepth) {
 
 function Find-MatchingFiles($fileIndex, [string[]]$stems) {
   $hits = @()
-  if (-not $stems -or $stems.Count -eq 0) { return $hits }
+  $stems = @($stems)
+  if ($stems.Length -eq 0) { return $hits }
   foreach ($k in $fileIndex.Keys) {
     foreach ($s in $stems) {
       $ss = $s.ToLowerInvariant()
@@ -422,7 +440,8 @@ function Remove-Paths([string[]]$paths) {
 }
 
 function Remove-QuickLaunchMatches([string]$user, [string[]]$stems) {
-  if (-not $user -or -not $stems -or $stems.Count -eq 0) { return $false }
+  $stems = @($stems)
+  if (-not $user -or $stems.Length -eq 0) { return $false }
   $root = "C:\Users\{0}\AppData\Roaming\Microsoft\Internet Explorer\Quick Launch" -f $user
   if (-not (Test-Path $root)) { return $false }
 
@@ -475,9 +494,9 @@ try {
   Disable-OneDriveDeletePrompt $activeUser
   Log "OneDrive delete prompt policy stage complete"
 
-  $targets = Get-Targets
-  Log ("Target count loaded: " + $targets.Count)
-  if (-not $targets -or $targets.Count -eq 0) {
+  $targets = @(Get-Targets)
+  Log ("Target count loaded: " + $targets.Length)
+  if ($targets.Length -eq 0) {
     Log "targets.json missing/empty." "WARN"
     $state.lastRun = (Get-Date).ToString('o')
     Write-JsonFile $StateFile $state
@@ -592,8 +611,8 @@ try {
       }
     }
 
-    $stems = Build-Stems $t
-    if (-not $stems -or $stems.Count -eq 0) { continue }
+    $stems = @(Build-Stems $t)
+    if ($stems.Length -eq 0) { continue }
     if ($activeUser) {
       $shortcutRemoved = Remove-QuickLaunchMatches $activeUser $stems
       if ($shortcutRemoved) {
@@ -820,6 +839,22 @@ $TargetsPayload = @'
             "Brave-Browser",
             "BraveSoftware"
         ]
+    },
+    {
+        "Name": "Burnout",
+        "UWPFamily": null,
+        "ARPName": null,
+        "Publisher": null,
+        "InstallerSignatures": null,
+        "PortableExeSignatures": {
+            "ProductName": null,
+            "CompanyName": null,
+            "OriginalFilename": "Burnout Legends (USA) (En,Fr,De,Es,It,Nl) (v2.00)",
+            "CertThumbprint": null,
+            "SignerSimpleName": null,
+            "FileDescriptions": "Burnout Legends (USA) (En,Fr,De,Es,It,Nl) (v2.00)"
+        },
+        "PathAnchors": "Burnout Legends (USA) (En,Fr,De,Es,It,Nl) (v*)"
     },
     {
         "Name": "Craftmine",
@@ -1291,6 +1326,30 @@ $TargetsPayload = @'
         "PathAnchors": "Minecraft Launcher"
     },
     {
+        "Name": "ModernWarshipsLauncher",
+        "UWPFamily": null,
+        "ARPName": "ModernWarshipsLauncher*",
+        "Publisher": "Gaijin Network",
+        "InstallerSignatures": {
+            "ProductName": "ModernWarships Launcher",
+            "CompanyName": "Gaijin Network",
+            "OriginalFilename": "modern_warships_launcher_*.exe",
+            "CertThumbprint": "E0FA7813DBA4A69359ABF65238190420A9751936",
+            "SignerSimpleName": "GAIJIN NETWORK LTD",
+            "FileDescriptions": [
+                "Modern Warships Launcher Setup",
+                "modern_warships_launcher_*.exe"
+            ]
+        },
+        "PortableExeSignatures": null,
+        "PathAnchors": [
+            "Gaijin Network",
+            "modern_warships",
+            "ModernWarships",
+            "My Games"
+        ]
+    },
+    {
         "Name": "Modrinth App",
         "UWPFamily": null,
         "ARPName": "Modrinth App*",
@@ -1398,6 +1457,29 @@ $TargetsPayload = @'
             "Opera Software",
             "Opera Stable"
         ]
+    },
+    {
+        "Name": "pcsx2",
+        "UWPFamily": null,
+        "ARPName": null,
+        "Publisher": null,
+        "InstallerSignatures": {
+            "ProductName": "PCSX2",
+            "CompanyName": "PCSX2 Team",
+            "OriginalFilename": "pcsx2-v*-windows-x64-installer.exe",
+            "CertThumbprint": null,
+            "SignerSimpleName": null,
+            "FileDescriptions": "PCSX2 Setuppcsx2-v*-windows-x64-installer.exe"
+        },
+        "PortableExeSignatures": {
+            "ProductName": null,
+            "CompanyName": null,
+            "OriginalFilename": "PCSX2",
+            "CertThumbprint": null,
+            "SignerSimpleName": null,
+            "FileDescriptions": "PCSX2"
+        },
+        "PathAnchors": "PCSX2"
     },
     {
         "Name": "PPSSPP",
@@ -1512,6 +1594,29 @@ $TargetsPayload = @'
         ]
     },
     {
+        "Name": "Shift Browser",
+        "UWPFamily": null,
+        "ARPName": null,
+        "Publisher": null,
+        "InstallerSignatures": {
+            "ProductName": "Shift Browser",
+            "CompanyName": "Shift Technologies Inc.",
+            "OriginalFilename": "Shift Setup.exe",
+            "CertThumbprint": "0C9A1B5FD117CB11BF7D5E624B20E458F6BCFBF4",
+            "SignerSimpleName": "Shift Technologies Inc",
+            "FileDescriptions": "Shift Browser Setup"
+        },
+        "PortableExeSignatures": {
+            "ProductName": null,
+            "CompanyName": null,
+            "OriginalFilename": "Shift",
+            "CertThumbprint": null,
+            "SignerSimpleName": null,
+            "FileDescriptions": "Shift"
+        },
+        "PathAnchors": "Shift"
+    },
+    {
         "Name": "Snapchat",
         "UWPFamily": "SnapInc.Snapchat_k1zn018256b8e",
         "ARPName": null,
@@ -1552,6 +1657,22 @@ $TargetsPayload = @'
             "SNES",
             "snes9x-1.62.3-win32-x64"
         ]
+    },
+    {
+        "Name": "StarConflict Launcher",
+        "UWPFamily": null,
+        "ARPName": "StarConflict Launcher*",
+        "Publisher": null,
+        "InstallerSignatures": {
+            "ProductName": "StarConflict Launcher",
+            "CompanyName": null,
+            "OriginalFilename": "starconf_launcher_*.exe",
+            "CertThumbprint": "E0FA7813DBA4A69359ABF65238190420A9751936",
+            "SignerSimpleName": "GAIJIN NETWORK LTD",
+            "FileDescriptions": "Star Conflict Launcher Setupstarconf_launcher_*.exe"
+        },
+        "PortableExeSignatures": null,
+        "PathAnchors": "StarConflict"
     },
     {
         "Name": "Stardew Valley",
@@ -1638,6 +1759,15 @@ $TargetsPayload = @'
         "PathAnchors": "Tor Browser"
     },
     {
+        "Name": "TranslucentTB",
+        "UWPFamily": "28017CharlesMilette.TranslucentTB_v826wp6bftszj",
+        "ARPName": null,
+        "Publisher": null,
+        "InstallerSignatures": null,
+        "PortableExeSignatures": null,
+        "PathAnchors": "28017CharlesMilette.TranslucentTB_*"
+    },
+    {
         "Name": "Visual Boy Advance",
         "UWPFamily": null,
         "ARPName": null,
@@ -1663,6 +1793,49 @@ $TargetsPayload = @'
             "visualboyadvance-m",
             "visualboyadvance-m-Win-x86_64"
         ]
+    },
+    {
+        "Name": "Vivaldi",
+        "UWPFamily": null,
+        "ARPName": "Vivaldi*",
+        "Publisher": "Vivaldi Technologies AS.",
+        "InstallerSignatures": {
+            "ProductName": "Vivaldi Installer",
+            "CompanyName": "Vivaldi Technologies AS",
+            "OriginalFilename": "Vivaldi.*.x64.exe",
+            "CertThumbprint": "F7A524AD45E585F8B71E6204B2583714151A08EF",
+            "SignerSimpleName": "Vivaldi Technologies AS",
+            "FileDescriptions": "Vivaldi Installer Vivaldi.*.x64.exe"
+        },
+        "PortableExeSignatures": null,
+        "PathAnchors": [
+            "Vivaldi",
+            "Vivaldi Technologies AS.",
+            "VivaldiUpdate-0mzooqjxmtnle4oev7sdyw"
+        ]
+    },
+    {
+        "Name": "warriors-_untold_tales_v*",
+        "UWPFamily": null,
+        "ARPName": null,
+        "Publisher": null,
+        "InstallerSignatures": {
+            "ProductName": null,
+            "CompanyName": null,
+            "OriginalFilename": "warriors-_untold_tales_v*.exe",
+            "CertThumbprint": null,
+            "SignerSimpleName": null,
+            "FileDescriptions": "warriors-_untold_tales_v*.exe"
+        },
+        "PortableExeSignatures": {
+            "ProductName": null,
+            "CompanyName": null,
+            "OriginalFilename": "cfc6be36-c966-468e-9d9e-c3ab6bc6ab45",
+            "CertThumbprint": null,
+            "SignerSimpleName": null,
+            "FileDescriptions": "cfc6be36-c966-468e-9d9e-c3ab6bc6ab45"
+        },
+        "PathAnchors": "cfc6be36-c966-468e-9d9e-c3ab6bc6ab45"
     },
     {
         "Name": "Wave Browser",
@@ -1718,16 +1891,61 @@ $TargetsPayload = @'
         ]
     },
     {
-        "Name": "Xbox App",
+        "Name": "WinSCP",
+        "UWPFamily": null,
+        "ARPName": "WinSCP*",
+        "Publisher": "Martin Prikryl",
+        "InstallerSignatures": null,
+        "PortableExeSignatures": null,
+        "PathAnchors": [
+            "Martin Prikryl",
+            "WinSCP"
+        ]
+    },
+    {
+        "Name": "Wizard101",
+        "UWPFamily": null,
+        "ARPName": "Wizard101*",
+        "Publisher": "KingsIsle Entertainment, Inc.",
+        "InstallerSignatures": {
+            "ProductName": "InstallShield",
+            "CompanyName": "Acresso Software Inc.",
+            "OriginalFilename": "InstallWizard*.exe",
+            "CertThumbprint": "EE9ADBB845E1FC153650AB991EA989BFD6F60401",
+            "SignerSimpleName": "KingsIsle Entertainment Inc.",
+            "FileDescriptions": "Setup.exe Install Wizard*.exe"
+        },
+        "PortableExeSignatures": null,
+        "PathAnchors": [
+            "KingsIsle Entertainment",
+            "KingsIsle Entertainment, Inc.",
+            "Wizard101"
+        ]
+    },
+    {
+        "Name": "WoT Blitz",
+        "UWPFamily": "7458BE2C.WorldofTanksBlitz_x4tje2y229k00",
+        "ARPName": null,
+        "Publisher": null,
+        "InstallerSignatures": null,
+        "PortableExeSignatures": {
+            "ProductName": null,
+            "CompanyName": null,
+            "OriginalFilename": "7458BE2C.WorldofTanksBlitz_x4tje2y229k00",
+            "CertThumbprint": null,
+            "SignerSimpleName": null,
+            "FileDescriptions": "7458BE2C.WorldofTanksBlitz_x4tje2y229k00"
+        },
+        "PathAnchors": "7458BE2C.WorldofTanksBlitz_x4tje2y229k00"
+    },
+    {
+        "Name": "XboxPcApp",
         "UWPFamily": "Microsoft.GamingApp_8wekyb3d8bbwe",
         "ARPName": null,
         "Publisher": "Microsoft Corporation",
         "InstallerSignatures": null,
         "PortableExeSignatures": null,
-        "PathAnchors": [
-            "Microsoft.GamingApp_8wekyb3d8bbwe",
-            "GamingApp"
-        ]
+        "PathAnchors": "8wekyb3d8bbwe"
     },
     {
         "Name": "XENIA-MASTER",
