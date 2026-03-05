@@ -372,6 +372,22 @@ function Get-InstallerPathCandidates($t) {
   return @($paths | Where-Object { $_ } | Select-Object -Unique)
 }
 
+
+function Get-InstallerPathCandidates($t) {
+  $paths = New-Object System.Collections.Generic.List[string]
+  foreach ($sig in @($t.PortableExeSignatures, $t.InstallerSignatures)) {
+    if (-not $sig) { continue }
+    $p = Get-SignatureValue $sig "InstallerPath"
+    if (-not $p) { continue }
+    if ($p -is [System.Array]) {
+      foreach ($one in $p) { if ($one) { $paths.Add([string]$one) } }
+    } else {
+      $paths.Add([string]$p)
+    }
+  }
+  return @($paths | Where-Object { $_ } | Select-Object -Unique)
+}
+
 function Index-Files($roots, $maxDepth) {
   $idx = @{}
   $exts = @('exe','msi','zip','7z','rar','msix','appx','appxbundle','msixbundle')
