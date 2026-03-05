@@ -497,6 +497,71 @@ function UniqueStrings {
   ($arr | Where-Object { $_ } | Group-Object | ForEach-Object { $_.Name })
 }
 
+function Get-ArpEntryKey {
+  param($Entry)
+
+  if (-not $Entry) { return $null }
+
+  $dn  = if ($Entry.DisplayName) { $Entry.DisplayName.ToString().Trim().ToLowerInvariant() } else { '' }
+  $kv  = if ($Entry.KeyName) { $Entry.KeyName.ToString().Trim().ToLowerInvariant() } else { '' }
+  $pub = if ($Entry.Publisher) { $Entry.Publisher.ToString().Trim().ToLowerInvariant() } else { '' }
+  $ver = if ($Entry.DisplayVersion) { $Entry.DisplayVersion.ToString().Trim().ToLowerInvariant() } else { '' }
+  $loc = if ($Entry.InstallLocation) { $Entry.InstallLocation.ToString().Trim().ToLowerInvariant() } else { '' }
+
+  # Ignore hive/source path so HKCU and HKU\SID mirrors collapse to one entry.
+  return "$dn|$kv|$pub|$ver|$loc"
+}
+
+function Get-UniqueArpEntries {
+  param([object[]]$Entries)
+
+  if (-not $Entries) { return @() }
+
+  $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  $out = @()
+  foreach ($e in $Entries) {
+    if (-not $e) { continue }
+    $k = Get-ArpEntryKey $e
+    if (-not $k) { continue }
+    if ($seen.Add($k)) { $out += $e }
+  }
+
+  return @($out)
+}
+
+function Get-UwpEntryKey {
+  param($Entry)
+
+  if (-not $Entry) { return $null }
+
+  if ($Entry.PSObject.Properties['PackageFamilyName'] -and $Entry.PackageFamilyName) {
+    return ('pfn:' + $Entry.PackageFamilyName.ToString().Trim().ToLowerInvariant())
+  }
+  if ($Entry.PSObject.Properties['PackageFullName'] -and $Entry.PackageFullName) {
+    return ('pfnfull:' + $Entry.PackageFullName.ToString().Trim().ToLowerInvariant())
+  }
+
+  $name = if ($Entry.PSObject.Properties['Name'] -and $Entry.Name) { $Entry.Name.ToString().Trim().ToLowerInvariant() } else { '' }
+  return ('name:' + $name)
+}
+
+function Get-UniqueUwpEntries {
+  param([object[]]$Entries)
+
+  if (-not $Entries) { return @() }
+
+  $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  $out = @()
+  foreach ($e in $Entries) {
+    if (-not $e) { continue }
+    $k = Get-UwpEntryKey $e
+    if (-not $k) { continue }
+    if ($seen.Add($k)) { $out += $e }
+  }
+
+  return @($out)
+}
+
 function Union-StringArrays {
   param($a,$b)
   # Always return an array, even when there are zero elements. Without wrapping, an empty
@@ -2305,6 +2370,7 @@ $DebugArp = $false
 
 $arpStage = $null
 $arpHits  = Find-ArpMatchesStaged -arpAll $arpAll -name $AppName -StageUsed ([ref]$arpStage) -DebugMode:$DebugArp
+$arpHits  = Get-UniqueArpEntries -Entries $arpHits
 
 if ($arpHits.Count -gt 0) {
   Write-Host ("ARP hits found (stage {0}):" -f $arpStage) -ForegroundColor Yellow
@@ -2495,6 +2561,7 @@ if ($active -and $active.SID) {
   $uwpSid = $active.SID
 }
 $uwpHits = Find-UwpByTokens -name $AppName -activeSid $uwpSid
+$uwpHits = Get-UniqueUwpEntries -Entries $uwpHits
 
     # Also perform a simplified substring-based search across registry entries.  This
     # helper scans the same package repositories but matches the search term as a
@@ -3633,7 +3700,7 @@ if (($arpHits.Count -eq 0) -and ($uwpHits.Count -eq 0) -and ($dirHits.Count -gt 
       $st=$null; $hits = Find-ArpMatchesStaged -arpAll $arpAll -name $rn -StageUsed ([ref]$st)
       if ($hits.Count -gt 0) {
         Write-Host "ARP retry using '$rn' found $($hits.Count) entries." -ForegroundColor Yellow
-        $arpHits = $hits
+        $arpHits = Get-UniqueArpEntries -Entries $hits
         $baseNames2 = @()
         foreach ($x in $arpHits) {
           $nx = $x.DisplayName
@@ -3687,7 +3754,7 @@ if (($arpHits.Count -eq 0) -and ($uwpHits.Count -eq 0) -and ($dirHits.Count -gt 
       if ($tmpHits.Count -gt 0) {
         Write-Host "UWP retry using '$rn' found $($tmpHits.Count) packages." -ForegroundColor Yellow
         foreach ($uh in $tmpHits) {
-          if (-not ($uwpHits -contains $uh)) { $uwpHits = @($uwpHits) + @($uh) }
+          $uwpHits = Get-UniqueUwpEntries -Entries (@($uwpHits) + @($uh))
         }
       }
       # If no hits from token-based search, and the retry name looks like a package
@@ -3714,7 +3781,7 @@ if (($arpHits.Count -eq 0) -and ($uwpHits.Count -eq 0) -and ($dirHits.Count -gt 
           if ($tmpHits2 -and $tmpHits2.Count -gt 0) {
             Write-Host "UWP (anchor) retry using '$rn' found $($tmpHits2.Count) packages." -ForegroundColor Yellow
             foreach ($uh in $tmpHits2) {
-              if (-not ($uwpHits -contains $uh)) { $uwpHits = @($uwpHits) + @($uh) }
+              $uwpHits = Get-UniqueUwpEntries -Entries (@($uwpHits) + @($uh))
             }
           }
         }
