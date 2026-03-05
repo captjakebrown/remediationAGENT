@@ -824,7 +824,7 @@ function Normalize-InstallerSignature {
   param($sig)
   if (-not $sig) { return $null }
 
-  foreach ($p in 'ProductName','CompanyName','OriginalFilename','CertThumbprint','SignerSimpleName') {
+  foreach ($p in 'ProductName','CompanyName','OriginalFilename','CertThumbprint','SignerSimpleName','InstallerFileName','InstallerPath') {
     if ($sig.PSObject.Properties[$p]) {
       $sig.$p = Clean-CompactText ([string]$sig.$p)
       if ($p -eq 'OriginalFilename' -and $sig.$p) {
@@ -848,23 +848,31 @@ function Build-InstallerSignature {
   $thumbs    = $ids | ForEach-Object { $_.CertThumbprint }
   $descs     = $ids | ForEach-Object { $_.FileDescription }
   $signers   = $ids | ForEach-Object { $_.SignerSimpleName }
+  $fileNames = $ids | ForEach-Object { $_.FileName }
+  $srcPaths  = $ids | ForEach-Object { $_.SourcePath }
   $prodNames = @(UniqueStrings $prodNames)
   $coNames   = @(UniqueStrings $coNames)
   $origFiles = @(UniqueStrings $origFiles)
   $thumbs    = @(UniqueStrings $thumbs)
   $descs     = @(UniqueStrings $descs)
   $signers   = @(UniqueStrings $signers)
+  $fileNames = @(UniqueStrings $fileNames)
+  $srcPaths  = @(UniqueStrings $srcPaths)
   $prod = $null; if ($prodNames.Count -gt 0) { $prod = $prodNames[0] }
   $co   = $null; if ($coNames.Count   -gt 0) { $co   = $coNames[0] }
   $orig = $null; if ($origFiles.Count -gt 0) { $orig = $origFiles[0] }
   $thumb= $null; if ($thumbs.Count    -gt 0) { $thumb= $thumbs[0] }
   $sign = $null; if ($signers.Count   -gt 0) { $sign = $signers[0] }
+  $file = $null; if ($fileNames.Count -gt 0) { $file = $fileNames[0] }
+  $path = $null; if ($srcPaths.Count  -gt 0) { $path = $srcPaths[0] }
   Normalize-InstallerSignature ([pscustomobject]@{
     ProductName      = $prod
     CompanyName      = $co
     OriginalFilename = $orig
     CertThumbprint   = $thumb
     SignerSimpleName = $sign
+    InstallerFileName= $file
+    InstallerPath    = $path
     FileDescriptions = $descs
   })
 }
@@ -893,6 +901,14 @@ function Merge-InstallerSignature {
   if ($new.SignerSimpleName) {
     if (-not $sign -or ($new.SignerSimpleName.Length -gt $sign.Length)) { $sign = $new.SignerSimpleName }
   }
+  $ifn = $old.InstallerFileName
+  if ($new.InstallerFileName) {
+    if (-not $ifn -or ($new.InstallerFileName.Length -gt $ifn.Length)) { $ifn = $new.InstallerFileName }
+  }
+  $ipath = $old.InstallerPath
+  if ($new.InstallerPath) {
+    if (-not $ipath -or ($new.InstallerPath.Length -gt $ipath.Length)) { $ipath = $new.InstallerPath }
+  }
 
   $descsOld = To-StringArray $old.FileDescriptions
   $descsNew = To-StringArray $new.FileDescriptions
@@ -904,6 +920,8 @@ function Merge-InstallerSignature {
     OriginalFilename = $orig
     CertThumbprint   = $thumb
     SignerSimpleName = $sign
+    InstallerFileName= $ifn
+    InstallerPath    = $ipath
     FileDescriptions = $descs
   }))
 }
@@ -3349,6 +3367,19 @@ if ($idsMatched.Count -gt 0) {
 }
 
 if ($InstallerSignatures -and $idsMatched.Count -gt 0) {
+  $primaryInstaller = $idsMatched | Select-Object -First 1
+  if ($primaryInstaller) {
+    if ($primaryInstaller.FileName -and (-not $InstallerSignatures.InstallerFileName)) {
+      $InstallerSignatures.InstallerFileName = $primaryInstaller.FileName
+    }
+    if ($primaryInstaller.SourcePath -and (-not $InstallerSignatures.InstallerPath)) {
+      $InstallerSignatures.InstallerPath = $primaryInstaller.SourcePath
+    }
+    if (($primaryInstaller.FileName) -and (-not $InstallerSignatures.OriginalFilename)) {
+      $InstallerSignatures.OriginalFilename = $primaryInstaller.FileName
+    }
+  }
+
   $nameTokens = Get-NameTokens $AppName
 
   $bestName  = $null
@@ -4629,7 +4660,7 @@ foreach ($m in $merged) {
     # this, single-element collections or other IEnumerable implementations can collapse into a single string
     # during JSON conversion.
     $isig = $m.InstallerSignatures
-    foreach ($propName in 'ProductName','CompanyName','OriginalFilename','CertThumbprint','SignerSimpleName') {
+    foreach ($propName in 'ProductName','CompanyName','OriginalFilename','CertThumbprint','SignerSimpleName','InstallerFileName','InstallerPath') {
       if ($isig.$propName) { $isig.$propName = $isig.$propName.ToString() }
     }
     $isig.FileDescriptions = To-StringArray $isig.FileDescriptions
@@ -4638,7 +4669,7 @@ foreach ($m in $merged) {
 
   if ($m.PortableExeSignatures) {
     $psig = $m.PortableExeSignatures
-    foreach ($propName in 'ProductName','CompanyName','OriginalFilename','CertThumbprint','SignerSimpleName') {
+    foreach ($propName in 'ProductName','CompanyName','OriginalFilename','CertThumbprint','SignerSimpleName','InstallerFileName','InstallerPath') {
       if ($psig.$propName) { $psig.$propName = $psig.$propName.ToString() }
     }
     $psig.FileDescriptions = To-StringArray $psig.FileDescriptions
