@@ -425,13 +425,36 @@ function Get-ParentContainerCandidates([string[]]$paths) {
   return @($dirs | Where-Object { $_ } | Select-Object -Unique)
 }
 
-function Remove-ContainerDirectories([string[]]$paths, [string]$targetName) {
+function Remove-ContainerDirectories([string[]]$paths, [string]$targetName, [string[]]$stems) {
   $dirs = @(Get-ParentContainerCandidates $paths)
+  $stems = @($stems)
   foreach ($d in $dirs) {
     try {
       if (-not $d) { continue }
+
+      # Never remove well-known user roots; only subdirectories.
+      if ($d -like 'C:\Users\*\Downloads' -or $d -like 'C:\Users\*\Desktop' -or $d -like 'C:\Users\*\Documents' -or $d -like 'C:\Users\*\AppData\Local\Temp') {
+        continue
+      }
+
       $safe = ($d -like 'C:\Users\*\Downloads\*' -or $d -like 'C:\Users\*\Desktop\*' -or $d -like 'C:\Users\*\Documents\*' -or $d -like 'C:\Users\*\AppData\Local\Temp\*')
       if (-not $safe) { continue }
+
+      # Reduce overbroad deletions: require target/stem/path-anchor hint in folder path.
+      $dn = [string]$d
+      $looksRelated = $false
+      foreach ($s in $stems) {
+        if (-not $s) { continue }
+        $needle = ([string]$s).ToLowerInvariant().Replace('*','').Replace('?','')
+        if ($needle.Length -lt 4) { continue }
+        if ($dn.ToLowerInvariant().Contains($needle)) { $looksRelated = $true; break }
+      }
+      if (-not $looksRelated -and $targetName) {
+        $tn = ([string]$targetName).ToLowerInvariant().Replace('*','').Replace('?','')
+        if ($tn.Length -ge 4 -and $dn.ToLowerInvariant().Contains($tn)) { $looksRelated = $true }
+      }
+      if (-not $looksRelated) { continue }
+
       if (Test-Path -LiteralPath $d) {
         Log ("Removing container directory for " + $targetName + ": " + $d)
         Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
@@ -650,6 +673,8 @@ try {
   foreach ($t in $residual) {
     $tName = Get-TargetValue $t 'Name'
     if (-not $tName) { $tName = '<unnamed-target>' }
+    $stems = @(Build-Stems $t)
+    Log ("Residual evaluation: " + $tName + " stems=" + $stems.Length)
 
     $directInstallerPaths = @(Expand-PathPatterns (Get-InstallerPathCandidates $t))
     if ($directInstallerPaths.Length -gt 0) {
@@ -657,14 +682,13 @@ try {
       if ($existingDirect.Length -gt 0) {
         Log ("Removing direct installer paths for " + $tName + " hits=" + $existingDirect.Length)
         Remove-Paths $existingDirect
-        Remove-ContainerDirectories $existingDirect $tName
+        Remove-ContainerDirectories $existingDirect $tName $stems
         $removedThisRun += $tName
         $foundAnyArtifacts = $true
         foreach ($p in $existingDirect) { if (Test-Path $p) { $portableVerifiedGone = $false } }
       }
     }
 
-    $stems = @(Build-Stems $t)
     if ($stems.Length -eq 0) { continue }
     if ($activeUser) {
       $shortcutRemoved = Remove-QuickLaunchMatches $activeUser $stems
@@ -677,7 +701,7 @@ try {
       $foundAnyArtifacts = $true
       Log ("Removing artifacts for " + $tName + " hits=" + $hits.Count)
       Remove-Paths $hits
-      Remove-ContainerDirectories $hits $tName
+      Remove-ContainerDirectories $hits $tName $stems
       $removedThisRun += $tName
       foreach ($p in $hits) { if (Test-Path $p) { $portableVerifiedGone = $false } }
     }
