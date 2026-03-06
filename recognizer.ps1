@@ -497,6 +497,71 @@ function UniqueStrings {
   ($arr | Where-Object { $_ } | Group-Object | ForEach-Object { $_.Name })
 }
 
+function Get-ArpEntryKey {
+  param($Entry)
+
+  if (-not $Entry) { return $null }
+
+  $dn  = if ($Entry.DisplayName) { $Entry.DisplayName.ToString().Trim().ToLowerInvariant() } else { '' }
+  $kv  = if ($Entry.KeyName) { $Entry.KeyName.ToString().Trim().ToLowerInvariant() } else { '' }
+  $pub = if ($Entry.Publisher) { $Entry.Publisher.ToString().Trim().ToLowerInvariant() } else { '' }
+  $ver = if ($Entry.DisplayVersion) { $Entry.DisplayVersion.ToString().Trim().ToLowerInvariant() } else { '' }
+  $loc = if ($Entry.InstallLocation) { $Entry.InstallLocation.ToString().Trim().ToLowerInvariant() } else { '' }
+
+  # Ignore hive/source path so HKCU and HKU\SID mirrors collapse to one entry.
+  return "$dn|$kv|$pub|$ver|$loc"
+}
+
+function Get-UniqueArpEntries {
+  param([object[]]$Entries)
+
+  if (-not $Entries) { return @() }
+
+  $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  $out = @()
+  foreach ($e in $Entries) {
+    if (-not $e) { continue }
+    $k = Get-ArpEntryKey $e
+    if (-not $k) { continue }
+    if ($seen.Add($k)) { $out += $e }
+  }
+
+  return @($out)
+}
+
+function Get-UwpEntryKey {
+  param($Entry)
+
+  if (-not $Entry) { return $null }
+
+  if ($Entry.PSObject.Properties['PackageFamilyName'] -and $Entry.PackageFamilyName) {
+    return ('pfn:' + $Entry.PackageFamilyName.ToString().Trim().ToLowerInvariant())
+  }
+  if ($Entry.PSObject.Properties['PackageFullName'] -and $Entry.PackageFullName) {
+    return ('pfnfull:' + $Entry.PackageFullName.ToString().Trim().ToLowerInvariant())
+  }
+
+  $name = if ($Entry.PSObject.Properties['Name'] -and $Entry.Name) { $Entry.Name.ToString().Trim().ToLowerInvariant() } else { '' }
+  return ('name:' + $name)
+}
+
+function Get-UniqueUwpEntries {
+  param([object[]]$Entries)
+
+  if (-not $Entries) { return @() }
+
+  $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  $out = @()
+  foreach ($e in $Entries) {
+    if (-not $e) { continue }
+    $k = Get-UwpEntryKey $e
+    if (-not $k) { continue }
+    if ($seen.Add($k)) { $out += $e }
+  }
+
+  return @($out)
+}
+
 function Union-StringArrays {
   param($a,$b)
   # Always return an array, even when there are zero elements. Without wrapping, an empty
@@ -759,11 +824,14 @@ function Normalize-InstallerSignature {
   param($sig)
   if (-not $sig) { return $null }
 
-  foreach ($p in 'ProductName','CompanyName','OriginalFilename','CertThumbprint','SignerSimpleName') {
+  foreach ($p in 'ProductName','CompanyName','OriginalFilename','CertThumbprint','SignerSimpleName','InstallerFileName','InstallerPath') {
     if ($sig.PSObject.Properties[$p]) {
       $sig.$p = Clean-CompactText ([string]$sig.$p)
       if ($p -eq 'OriginalFilename' -and $sig.$p) {
         $sig.$p = Strip-DuplicateSuffix $sig.$p
+      }
+      elseif ($p -eq 'InstallerPath' -and $sig.$p) {
+        $sig.$p = Normalize-InstallerPathPattern $sig.$p
       }
     }
   }
@@ -783,23 +851,31 @@ function Build-InstallerSignature {
   $thumbs    = $ids | ForEach-Object { $_.CertThumbprint }
   $descs     = $ids | ForEach-Object { $_.FileDescription }
   $signers   = $ids | ForEach-Object { $_.SignerSimpleName }
+  $fileNames = $ids | ForEach-Object { $_.FileName }
+  $srcPaths  = $ids | ForEach-Object { $_.SourcePath }
   $prodNames = @(UniqueStrings $prodNames)
   $coNames   = @(UniqueStrings $coNames)
   $origFiles = @(UniqueStrings $origFiles)
   $thumbs    = @(UniqueStrings $thumbs)
   $descs     = @(UniqueStrings $descs)
   $signers   = @(UniqueStrings $signers)
+  $fileNames = @(UniqueStrings $fileNames)
+  $srcPaths  = @(UniqueStrings $srcPaths)
   $prod = $null; if ($prodNames.Count -gt 0) { $prod = $prodNames[0] }
   $co   = $null; if ($coNames.Count   -gt 0) { $co   = $coNames[0] }
   $orig = $null; if ($origFiles.Count -gt 0) { $orig = $origFiles[0] }
   $thumb= $null; if ($thumbs.Count    -gt 0) { $thumb= $thumbs[0] }
   $sign = $null; if ($signers.Count   -gt 0) { $sign = $signers[0] }
+  $file = $null; if ($fileNames.Count -gt 0) { $file = $fileNames[0] }
+  $path = $null; if ($srcPaths.Count  -gt 0) { $path = $srcPaths[0] }
   Normalize-InstallerSignature ([pscustomobject]@{
     ProductName      = $prod
     CompanyName      = $co
     OriginalFilename = $orig
     CertThumbprint   = $thumb
     SignerSimpleName = $sign
+    InstallerFileName= $file
+    InstallerPath    = $path
     FileDescriptions = $descs
   })
 }
@@ -828,6 +904,14 @@ function Merge-InstallerSignature {
   if ($new.SignerSimpleName) {
     if (-not $sign -or ($new.SignerSimpleName.Length -gt $sign.Length)) { $sign = $new.SignerSimpleName }
   }
+  $ifn = $old.InstallerFileName
+  if ($new.InstallerFileName) {
+    if (-not $ifn -or ($new.InstallerFileName.Length -gt $ifn.Length)) { $ifn = $new.InstallerFileName }
+  }
+  $ipath = $old.InstallerPath
+  if ($new.InstallerPath) {
+    if (-not $ipath -or ($new.InstallerPath.Length -gt $ipath.Length)) { $ipath = $new.InstallerPath }
+  }
 
   $descsOld = To-StringArray $old.FileDescriptions
   $descsNew = To-StringArray $new.FileDescriptions
@@ -839,6 +923,8 @@ function Merge-InstallerSignature {
     OriginalFilename = $orig
     CertThumbprint   = $thumb
     SignerSimpleName = $sign
+    InstallerFileName= $ifn
+    InstallerPath    = $ipath
     FileDescriptions = $descs
   }))
 }
@@ -2190,6 +2276,73 @@ function Strip-DuplicateSuffix {
   return $s
 }
 
+function Normalize-InstallerPathPattern {
+  param([string]$Path)
+
+  if (-not $Path) { return $null }
+
+  $p = $Path.Trim().Trim([char]34,[char]39)
+  if (-not $p) { return $null }
+
+  # Keep paths user-agnostic so signatures are reusable across endpoints.
+  $p = [regex]::Replace($p, '(?i)\\Users\\[^\\]+', '\\Users\\*')
+
+  # Replace duplicate-download suffixes like "Game (1).exe" and folder variants
+  # with a wildcard so variable numbering still matches.
+  $p = [regex]::Replace($p, '\s\(\d+\)(?=(\\|\.|$))', '*')
+
+  # Generalize explicit version tokens such as v104.6, 142.2.2, 2025-09-01.
+  $p = [regex]::Replace($p, '(?i)\bv?\d+(?:[\._-]\d+){1,}\b', '*')
+  $p = [regex]::Replace($p, '\b\d{3,}\b', '*')
+
+  # Normalize repeated wildcards and stray separators around wildcards.
+  $p = [regex]::Replace($p, '\*{2,}', '*')
+  $p = [regex]::Replace($p, '\*\.', '*.')
+    $p = $p.Trim()
+
+  if (-not $p) { return $null }
+  return $p
+}
+
+function Normalize-PathAnchors {
+  param([object]$Value)
+
+  if ($null -eq $Value) { return @() }
+
+  $raw = @()
+  if ($Value -is [string]) {
+    # Backward compatibility: some older JSON entries persisted anchors as one
+    # comma-separated string. Split them back into tokens.
+    $split = [regex]::Split($Value, '[,;\r\n]+')
+    foreach ($s in $split) {
+      $v = Normalize-StringField -Value $s
+      if ($v) { $raw += $v }
+    }
+  }
+  elseif ($Value -is [System.Collections.IEnumerable]) {
+    foreach ($item in $Value) {
+      if ($null -eq $item) { continue }
+      if ($item -is [string]) {
+        $split = [regex]::Split($item, '[,;\r\n]+')
+        foreach ($s in $split) {
+          $v = Normalize-StringField -Value $s
+          if ($v) { $raw += $v }
+        }
+      } else {
+        $v = Normalize-StringField -Value ($item.ToString())
+        if ($v) { $raw += $v }
+      }
+    }
+  }
+  else {
+    $v = Normalize-StringField -Value ($Value.ToString())
+    if ($v) { $raw += $v }
+  }
+
+  if ($raw.Count -eq 0) { return @() }
+  return @($raw | Sort-Object -Unique)
+}
+
 function Normalize-StringField {
     param(
         [string]$Value
@@ -2305,6 +2458,7 @@ $DebugArp = $false
 
 $arpStage = $null
 $arpHits  = Find-ArpMatchesStaged -arpAll $arpAll -name $AppName -StageUsed ([ref]$arpStage) -DebugMode:$DebugArp
+$arpHits  = Get-UniqueArpEntries -Entries $arpHits
 
 if ($arpHits.Count -gt 0) {
   Write-Host ("ARP hits found (stage {0}):" -f $arpStage) -ForegroundColor Yellow
@@ -2495,6 +2649,7 @@ if ($active -and $active.SID) {
   $uwpSid = $active.SID
 }
 $uwpHits = Find-UwpByTokens -name $AppName -activeSid $uwpSid
+$uwpHits = Get-UniqueUwpEntries -Entries $uwpHits
 
     # Also perform a simplified substring-based search across registry entries.  This
     # helper scans the same package repositories but matches the search term as a
@@ -3282,6 +3437,19 @@ if ($idsMatched.Count -gt 0) {
 }
 
 if ($InstallerSignatures -and $idsMatched.Count -gt 0) {
+  $primaryInstaller = $idsMatched | Select-Object -First 1
+  if ($primaryInstaller) {
+    if ($primaryInstaller.FileName -and (-not $InstallerSignatures.InstallerFileName)) {
+      $InstallerSignatures.InstallerFileName = $primaryInstaller.FileName
+    }
+    if ($primaryInstaller.SourcePath -and (-not $InstallerSignatures.InstallerPath)) {
+      $InstallerSignatures.InstallerPath = Normalize-InstallerPathPattern $primaryInstaller.SourcePath
+    }
+    if (($primaryInstaller.FileName) -and (-not $InstallerSignatures.OriginalFilename)) {
+      $InstallerSignatures.OriginalFilename = $primaryInstaller.FileName
+    }
+  }
+
   $nameTokens = Get-NameTokens $AppName
 
   $bestName  = $null
@@ -3633,7 +3801,7 @@ if (($arpHits.Count -eq 0) -and ($uwpHits.Count -eq 0) -and ($dirHits.Count -gt 
       $st=$null; $hits = Find-ArpMatchesStaged -arpAll $arpAll -name $rn -StageUsed ([ref]$st)
       if ($hits.Count -gt 0) {
         Write-Host "ARP retry using '$rn' found $($hits.Count) entries." -ForegroundColor Yellow
-        $arpHits = $hits
+        $arpHits = Get-UniqueArpEntries -Entries $hits
         $baseNames2 = @()
         foreach ($x in $arpHits) {
           $nx = $x.DisplayName
@@ -3687,7 +3855,7 @@ if (($arpHits.Count -eq 0) -and ($uwpHits.Count -eq 0) -and ($dirHits.Count -gt 
       if ($tmpHits.Count -gt 0) {
         Write-Host "UWP retry using '$rn' found $($tmpHits.Count) packages." -ForegroundColor Yellow
         foreach ($uh in $tmpHits) {
-          if (-not ($uwpHits -contains $uh)) { $uwpHits = @($uwpHits) + @($uh) }
+          $uwpHits = Get-UniqueUwpEntries -Entries (@($uwpHits) + @($uh))
         }
       }
       # If no hits from token-based search, and the retry name looks like a package
@@ -3714,7 +3882,7 @@ if (($arpHits.Count -eq 0) -and ($uwpHits.Count -eq 0) -and ($dirHits.Count -gt 
           if ($tmpHits2 -and $tmpHits2.Count -gt 0) {
             Write-Host "UWP (anchor) retry using '$rn' found $($tmpHits2.Count) packages." -ForegroundColor Yellow
             foreach ($uh in $tmpHits2) {
-              if (-not ($uwpHits -contains $uh)) { $uwpHits = @($uwpHits) + @($uh) }
+              $uwpHits = Get-UniqueUwpEntries -Entries (@($uwpHits) + @($uh))
             }
           }
         }
@@ -4477,7 +4645,7 @@ $didMerge = $false
 
 foreach ($e in $existing) {
   $e.UWPFamily = To-StringArray $e.UWPFamily
-  $e.PathAnchors = To-StringArray $e.PathAnchors
+  $e.PathAnchors = Normalize-PathAnchors $e.PathAnchors
 
   if ($e.PSObject.Properties['Installer']) {
     $e.PSObject.Properties.Remove('Installer')
@@ -4553,7 +4721,7 @@ foreach ($m in $merged) {
   $m.UWPFamily = $m.UWPFamily | Sort-Object -Unique
 
 
-  $m.PathAnchors = To-StringArray $m.PathAnchors
+  $m.PathAnchors = Normalize-PathAnchors $m.PathAnchors
 
   if ($m.InstallerSignatures) {
     # Normalize the installer signature to ensure string fields are compact and descriptions are normalized
@@ -4562,7 +4730,7 @@ foreach ($m in $merged) {
     # this, single-element collections or other IEnumerable implementations can collapse into a single string
     # during JSON conversion.
     $isig = $m.InstallerSignatures
-    foreach ($propName in 'ProductName','CompanyName','OriginalFilename','CertThumbprint','SignerSimpleName') {
+    foreach ($propName in 'ProductName','CompanyName','OriginalFilename','CertThumbprint','SignerSimpleName','InstallerFileName','InstallerPath') {
       if ($isig.$propName) { $isig.$propName = $isig.$propName.ToString() }
     }
     $isig.FileDescriptions = To-StringArray $isig.FileDescriptions
@@ -4571,7 +4739,7 @@ foreach ($m in $merged) {
 
   if ($m.PortableExeSignatures) {
     $psig = $m.PortableExeSignatures
-    foreach ($propName in 'ProductName','CompanyName','OriginalFilename','CertThumbprint','SignerSimpleName') {
+    foreach ($propName in 'ProductName','CompanyName','OriginalFilename','CertThumbprint','SignerSimpleName','InstallerFileName','InstallerPath') {
       if ($psig.$propName) { $psig.$propName = $psig.$propName.ToString() }
     }
     $psig.FileDescriptions = To-StringArray $psig.FileDescriptions
