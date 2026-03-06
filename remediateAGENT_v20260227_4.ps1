@@ -1,7 +1,7 @@
 <#
 RSD CleanAgent - Intune Proactive Remediation Remediation
 PowerShell 5.1 compatible
-Version: 2026.03.06.3
+Version: 2026.03.06.4
 
 Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
 #>
@@ -20,12 +20,12 @@ $VersionFile = Join-Path $AgentRoot 'version.txt'
 $StateFile   = Join-Path $AgentRoot 'state.json'
 $LogDir      = Join-Path $AgentRoot 'Logs'
 
-$ThisVersion = '2026.03.06.3'
+$ThisVersion = '2026.03.06.4'
 
 $AgentPayload = @'
 <#
 RSD CleanAgent (local) - PowerShell 5.1
-Version: 2026.03.06.3
+Version: 2026.03.06.4
 
 Behavior:
 - Batch inventory UWP/ARP once per run.
@@ -463,6 +463,40 @@ function Remove-ContainerDirectories([string[]]$paths, [string]$targetName, [str
   }
 }
 
+
+function Remove-MatchingTopLevelDirs([string[]]$bases, [string[]]$stems, [string]$targetName) {
+  $removed = 0
+  $stems = @($stems | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant().Replace('*','').Replace('?','') } | Where-Object { $_.Length -ge 5 } | Select-Object -Unique)
+  if ($stems.Length -eq 0) { return 0 }
+
+  foreach ($b in @($bases)) {
+    if (-not $b) { continue }
+    if (-not (Test-Path -LiteralPath $b -PathType Container)) { continue }
+    try {
+      $dirs = @(Get-ChildItem -LiteralPath $b -Directory -Force -ErrorAction SilentlyContinue)
+      foreach ($d in $dirs) {
+        $dn = $d.Name.ToLowerInvariant()
+        $isMatch = $false
+        foreach ($s in $stems) {
+          if ($dn.Contains($s)) { $isMatch = $true; break }
+        }
+        if (-not $isMatch) { continue }
+
+        # Keep this conservative: avoid deleting whole profile roots.
+        if ($d.FullName -like 'C:\Users\*\AppData\*' -or $d.FullName -like 'C:\Program Files*\*') {
+          Log ("Removing top-level app directory for " + $targetName + ": " + $d.FullName)
+          try {
+            Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            $removed += 1
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+
+  return $removed
+}
+
 function Index-Files($roots, $maxDepth) {
   $idx = @{}
   $exts = @('exe','msi','zip','7z','rar','msix','appx','appxbundle','msixbundle')
@@ -708,9 +742,20 @@ try {
   }
 
   $roots = @()
-  if ($activeUser) { $roots += (Get-PresenceZonesForUser $activeUser) }
+  $appRoots = @()
+  if ($activeUser) {
+    $roots += (Get-PresenceZonesForUser $activeUser)
+    $profileRoot = Get-ProfileRootForUser $activeUser
+    if ($profileRoot) {
+      $appRoots += (Join-Path $profileRoot 'AppData\Local')
+      $appRoots += (Join-Path $profileRoot 'AppData\Roaming')
+    }
+  }
+  $appRoots += 'C:\Program Files'
+  $appRoots += 'C:\Program Files (x86)'
   $roots += (Get-ShallowCDrives)
   $roots = $roots | Where-Object { $_ } | Select-Object -Unique
+  $appRoots = $appRoots | Where-Object { $_ } | Select-Object -Unique
 
   Log ("Index roots: " + ($roots -join '; '))
   Log "Starting filesystem index pass"
@@ -775,6 +820,18 @@ try {
       Remove-ContainerDirectories $hits $tName $stems
       $removedThisRun += $tName
       foreach ($p in $hits) { if (Test-Path $p) { $portableVerifiedGone = $false } }
+    }
+
+    $dirHits = Remove-MatchingTopLevelDirs $appRoots $stems $tName
+    if ($dirHits -gt 0) {
+      $foundAnyArtifacts = $true
+      $targetHitCount += $dirHits
+      $removedThisRun += $tName
+      Log ("Top-level app directory sweep removed entries for " + $tName + " count=" + $dirHits)
+    }
+
+    if ($targetHitCount -eq 0) {
+      Log ("Residual evaluation produced no removable hits for " + $tName)
     }
 
     if ($targetHitCount -gt 0) {
