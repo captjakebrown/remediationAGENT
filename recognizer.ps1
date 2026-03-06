@@ -830,6 +830,9 @@ function Normalize-InstallerSignature {
       if ($p -eq 'OriginalFilename' -and $sig.$p) {
         $sig.$p = Strip-DuplicateSuffix $sig.$p
       }
+      elseif ($p -eq 'InstallerPath' -and $sig.$p) {
+        $sig.$p = Normalize-InstallerPathPattern $sig.$p
+      }
     }
   }
 
@@ -2273,6 +2276,73 @@ function Strip-DuplicateSuffix {
   return $s
 }
 
+function Normalize-InstallerPathPattern {
+  param([string]$Path)
+
+  if (-not $Path) { return $null }
+
+  $p = $Path.Trim().Trim([char]34,[char]39)
+  if (-not $p) { return $null }
+
+  # Keep paths user-agnostic so signatures are reusable across endpoints.
+  $p = [regex]::Replace($p, '(?i)\\Users\\[^\\]+', '\\Users\\*')
+
+  # Replace duplicate-download suffixes like "Game (1).exe" and folder variants
+  # with a wildcard so variable numbering still matches.
+  $p = [regex]::Replace($p, '\s\(\d+\)(?=(\\|\.|$))', '*')
+
+  # Generalize explicit version tokens such as v104.6, 142.2.2, 2025-09-01.
+  $p = [regex]::Replace($p, '(?i)\bv?\d+(?:[\._-]\d+){1,}\b', '*')
+  $p = [regex]::Replace($p, '\b\d{3,}\b', '*')
+
+  # Normalize repeated wildcards and stray separators around wildcards.
+  $p = [regex]::Replace($p, '\*{2,}', '*')
+  $p = [regex]::Replace($p, '\*\.', '*.')
+    $p = $p.Trim()
+
+  if (-not $p) { return $null }
+  return $p
+}
+
+function Normalize-PathAnchors {
+  param([object]$Value)
+
+  if ($null -eq $Value) { return @() }
+
+  $raw = @()
+  if ($Value -is [string]) {
+    # Backward compatibility: some older JSON entries persisted anchors as one
+    # comma-separated string. Split them back into tokens.
+    $split = [regex]::Split($Value, '[,;\r\n]+')
+    foreach ($s in $split) {
+      $v = Normalize-StringField -Value $s
+      if ($v) { $raw += $v }
+    }
+  }
+  elseif ($Value -is [System.Collections.IEnumerable]) {
+    foreach ($item in $Value) {
+      if ($null -eq $item) { continue }
+      if ($item -is [string]) {
+        $split = [regex]::Split($item, '[,;\r\n]+')
+        foreach ($s in $split) {
+          $v = Normalize-StringField -Value $s
+          if ($v) { $raw += $v }
+        }
+      } else {
+        $v = Normalize-StringField -Value ($item.ToString())
+        if ($v) { $raw += $v }
+      }
+    }
+  }
+  else {
+    $v = Normalize-StringField -Value ($Value.ToString())
+    if ($v) { $raw += $v }
+  }
+
+  if ($raw.Count -eq 0) { return @() }
+  return @($raw | Sort-Object -Unique)
+}
+
 function Normalize-StringField {
     param(
         [string]$Value
@@ -3373,7 +3443,7 @@ if ($InstallerSignatures -and $idsMatched.Count -gt 0) {
       $InstallerSignatures.InstallerFileName = $primaryInstaller.FileName
     }
     if ($primaryInstaller.SourcePath -and (-not $InstallerSignatures.InstallerPath)) {
-      $InstallerSignatures.InstallerPath = $primaryInstaller.SourcePath
+      $InstallerSignatures.InstallerPath = Normalize-InstallerPathPattern $primaryInstaller.SourcePath
     }
     if (($primaryInstaller.FileName) -and (-not $InstallerSignatures.OriginalFilename)) {
       $InstallerSignatures.OriginalFilename = $primaryInstaller.FileName
@@ -4575,7 +4645,7 @@ $didMerge = $false
 
 foreach ($e in $existing) {
   $e.UWPFamily = To-StringArray $e.UWPFamily
-  $e.PathAnchors = To-StringArray $e.PathAnchors
+  $e.PathAnchors = Normalize-PathAnchors $e.PathAnchors
 
   if ($e.PSObject.Properties['Installer']) {
     $e.PSObject.Properties.Remove('Installer')
@@ -4651,7 +4721,7 @@ foreach ($m in $merged) {
   $m.UWPFamily = $m.UWPFamily | Sort-Object -Unique
 
 
-  $m.PathAnchors = To-StringArray $m.PathAnchors
+  $m.PathAnchors = Normalize-PathAnchors $m.PathAnchors
 
   if ($m.InstallerSignatures) {
     # Normalize the installer signature to ensure string fields are compact and descriptions are normalized
