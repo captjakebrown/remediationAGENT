@@ -1,7 +1,7 @@
 <#
 RSD CleanAgent - Intune Proactive Remediation Remediation
 PowerShell 5.1 compatible
-Version: 2026.03.06.1
+Version: 2026.03.06.2
 
 Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
 #>
@@ -20,12 +20,12 @@ $VersionFile = Join-Path $AgentRoot 'version.txt'
 $StateFile   = Join-Path $AgentRoot 'state.json'
 $LogDir      = Join-Path $AgentRoot 'Logs'
 
-$ThisVersion = '2026.03.06.1'
+$ThisVersion = '2026.03.06.2'
 
 $AgentPayload = @'
 <#
 RSD CleanAgent (local) - PowerShell 5.1
-Version: 2026.03.06.1
+Version: 2026.03.06.2
 
 Behavior:
 - Batch inventory UWP/ARP once per run.
@@ -542,6 +542,45 @@ function Remove-QuickLaunchMatches([string]$user, [string[]]$stems) {
   return $removed
 }
 
+function Get-InstallerPatternCandidates($t) {
+  $patterns = New-Object System.Collections.Generic.List[string]
+  foreach ($sig in @($t.PortableExeSignatures, $t.InstallerSignatures)) {
+    if (-not $sig) { continue }
+    foreach ($n in @('InstallerFileName','OriginalFilename')) {
+      $v = Get-SignatureValue $sig $n
+      if ($v -and $v -is [string]) {
+        $patterns.Add($v)
+        try {
+          $fn = [System.IO.Path]::GetFileName($v)
+          if ($fn) { $patterns.Add($fn) }
+        } catch {}
+      }
+    }
+    $ip = Get-SignatureValue $sig 'InstallerPath'
+    if ($ip -and $ip -is [string]) {
+      try {
+        $pfn = [System.IO.Path]::GetFileName($ip)
+        if ($pfn) { $patterns.Add($pfn) }
+      } catch {}
+    }
+  }
+  return @($patterns | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function Find-InstallerFiles($fileIndex, [string[]]$patterns) {
+  $hits = @()
+  $patterns = @($patterns)
+  if ($patterns.Length -eq 0) { return $hits }
+  foreach ($k in $fileIndex.Keys) {
+    foreach ($pat in $patterns) {
+      if (-not $pat) { continue }
+      $p = ([string]$pat).ToLowerInvariant()
+      if ($k -like $p) { $hits += $fileIndex[$k]; break }
+    }
+  }
+  return @($hits | Select-Object -Unique)
+}
+
 # MAIN
 $scriptExitCode = 0
 $mutexName = 'Global\\RSDCleanAgentMutex'
@@ -669,12 +708,29 @@ try {
 
   $portableVerifiedGone = $true
   $foundAnyArtifacts = $false
+  $residualEvaluated = 0
+  $residualWithHits = 0
+  $residualTotalHits = 0
 
   foreach ($t in $residual) {
+    $residualEvaluated += 1
     $tName = Get-TargetValue $t 'Name'
     if (-not $tName) { $tName = '<unnamed-target>' }
     $stems = @(Build-Stems $t)
     Log ("Residual evaluation: " + $tName + " stems=" + $stems.Length)
+    $targetHitCount = 0
+
+    $installerPatterns = @(Get-InstallerPatternCandidates $t)
+    $installerHits = @(Find-InstallerFiles $fileIndex $installerPatterns)
+    if ($installerHits.Length -gt 0) {
+      Log ("Removing installer artifacts for " + $tName + " hits=" + $installerHits.Length)
+      Remove-Paths $installerHits
+      Remove-ContainerDirectories $installerHits $tName $stems
+      $removedThisRun += $tName
+      $foundAnyArtifacts = $true
+      $targetHitCount += $installerHits.Length
+      foreach ($p in $installerHits) { if (Test-Path $p) { $portableVerifiedGone = $false } }
+    }
 
     $directInstallerPaths = @(Expand-PathPatterns (Get-InstallerPathCandidates $t))
     if ($directInstallerPaths.Length -gt 0) {
@@ -685,6 +741,7 @@ try {
         Remove-ContainerDirectories $existingDirect $tName $stems
         $removedThisRun += $tName
         $foundAnyArtifacts = $true
+        $targetHitCount += $existingDirect.Length
         foreach ($p in $existingDirect) { if (Test-Path $p) { $portableVerifiedGone = $false } }
       }
     }
@@ -699,13 +756,22 @@ try {
     $hits = @(Find-MatchingFiles $fileIndex $stems)
     if ($hits.Length -gt 0) {
       $foundAnyArtifacts = $true
+      $targetHitCount += $hits.Length
       Log ("Removing artifacts for " + $tName + " hits=" + $hits.Count)
       Remove-Paths $hits
       Remove-ContainerDirectories $hits $tName $stems
       $removedThisRun += $tName
       foreach ($p in $hits) { if (Test-Path $p) { $portableVerifiedGone = $false } }
     }
+
+    if ($targetHitCount -gt 0) {
+      $residualWithHits += 1
+      $residualTotalHits += $targetHitCount
+      Log ("Residual target summary: " + $tName + " totalHits=" + $targetHitCount)
+    }
   }
+
+  Log ("Residual pass complete. evaluated=" + $residualEvaluated + " withHits=" + $residualWithHits + " totalHits=" + $residualTotalHits)
 
   $foundAny = @($foundThisRun | Select-Object -Unique)
   if ($foundAny.Length -gt 0 -or $foundAnyArtifacts) {
@@ -719,11 +785,19 @@ try {
 
   $state.lastRun = (Get-Date).ToString('o')
   Write-JsonFile $StateFile $state
+  Log ("State updated. phase=" + $state.phase + " detected=" + $foundAny.Length + " removed=" + (@($removedThisRun | Select-Object -Unique)).Length)
 
   if (-not $portableVerifiedGone) {
     Log -m "Portable verification failed (some artifacts remain)." -lvl "WARN"
     $scriptExitCode = 1
   }
+
+  Log ("cleanAGENT main completed with exit code " + $scriptExitCode)
+}
+catch {
+  $scriptExitCode = 1
+  $errText = $_ | Out-String
+  Log -m ("Unhandled exception in cleanAGENT main: " + $errText.Trim()) -lvl "ERROR"
 }
 catch {
   $scriptExitCode = 1
