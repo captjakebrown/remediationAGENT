@@ -1,7 +1,7 @@
 <#
 RSD CleanAgent - Intune Proactive Remediation Remediation
 PowerShell 5.1 compatible
-Version: 2026.03.05.4
+Version: 2026.03.06.1
 
 Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
 #>
@@ -20,12 +20,12 @@ $VersionFile = Join-Path $AgentRoot 'version.txt'
 $StateFile   = Join-Path $AgentRoot 'state.json'
 $LogDir      = Join-Path $AgentRoot 'Logs'
 
-$ThisVersion = '2026.03.05.4'
+$ThisVersion = '2026.03.06.1'
 
 $AgentPayload = @'
 <#
 RSD CleanAgent (local) - PowerShell 5.1
-Version: 2026.03.05.4
+Version: 2026.03.06.1
 
 Behavior:
 - Batch inventory UWP/ARP once per run.
@@ -188,8 +188,7 @@ function Ensure-ReceiptAcl([string]$p) {
   try { (Get-Item $p -ErrorAction SilentlyContinue).Attributes = 'ReadOnly' } catch {}
   try {
     icacls $p /inheritance:r | Out-Null
-    icacls $p /grant:r "Users:(RX)" "Administrators:(F)" "SYSTEM:(F)" | Out-Null
-    icacls $p /deny "Users:(W,WDAC,WO,D,DC)" | Out-Null
+    icacls $p /grant:r "Users:(R)" "Authenticated Users:(R)" "Everyone:(R)" "Administrators:(F)" "SYSTEM:(F)" | Out-Null
   } catch {}
 }
 
@@ -331,6 +330,29 @@ function Get-SignatureValue($signature, [string]$name) {
 
 function Build-Stems($t) {
   $stems = New-Object System.Collections.Generic.List[string]
+
+  $tName = Get-TargetValue $t 'Name'
+  $tArpName = Get-TargetValue $t 'ARPName'
+  $tAnchors = Get-TargetValue $t 'PathAnchors'
+
+  foreach ($candidate in @($tName, $tArpName)) {
+    if (-not $candidate) { continue }
+    $clean = ([string]$candidate).Replace('*','').Replace('?','')
+    if ($clean.Length -ge 4) {
+      $stems.Add($clean)
+      $stems.Add(($clean -replace '[\s\.\-_\:]',''))
+    }
+  }
+
+  foreach ($a in @($tAnchors)) {
+    if (-not $a) { continue }
+    $cleanA = ([string]$a).Replace('*','').Replace('?','')
+    if ($cleanA.Length -ge 4) {
+      $stems.Add($cleanA)
+      $stems.Add(($cleanA -replace '[\s\.\-_\:]',''))
+    }
+  }
+
   foreach ($sig in @($t.PortableExeSignatures, $t.InstallerSignatures)) {
     if (-not $sig) { continue }
     $pn = Get-SignatureValue $sig 'ProductName'
@@ -349,11 +371,11 @@ function Build-Stems($t) {
       } catch {}
       if ($candidate -is [string] -and $candidate.Length -ge 4) {
         $stems.Add($candidate)
-        $stems.Add(($candidate -replace '[\s\.\-_\\:]',''))
+        $stems.Add(($candidate -replace '[\s\.\-_\:]',''))
       }
     }
   }
-  return @($stems | Where-Object { $_ -and $_.Length -ge 4 } | Select-Object -Unique | Select-Object -First 10)
+  return @($stems | Where-Object { $_ -and $_.Length -ge 4 } | Select-Object -Unique | Select-Object -First 30)
 }
 
 
@@ -372,20 +394,50 @@ function Get-InstallerPathCandidates($t) {
   return @($paths | Where-Object { $_ } | Select-Object -Unique)
 }
 
-
-function Get-InstallerPathCandidates($t) {
-  $paths = New-Object System.Collections.Generic.List[string]
-  foreach ($sig in @($t.PortableExeSignatures, $t.InstallerSignatures)) {
-    if (-not $sig) { continue }
-    $p = Get-SignatureValue $sig "InstallerPath"
-    if (-not $p) { continue }
-    if ($p -is [System.Array]) {
-      foreach ($one in $p) { if ($one) { $paths.Add([string]$one) } }
-    } else {
-      $paths.Add([string]$p)
-    }
+function Expand-PathPatterns([string[]]$patterns) {
+  $resolved = New-Object System.Collections.Generic.List[string]
+  foreach ($pattern in @($patterns)) {
+    if (-not $pattern) { continue }
+    try {
+      $items = @(Get-Item -Path ([string]$pattern) -Force -ErrorAction SilentlyContinue)
+      foreach ($it in $items) {
+        if ($it -and $it.FullName) { $resolved.Add([string]$it.FullName) }
+      }
+    } catch {}
+    try {
+      if (Test-Path -LiteralPath ([string]$pattern)) { $resolved.Add([string]$pattern) }
+    } catch {}
   }
-  return @($paths | Where-Object { $_ } | Select-Object -Unique)
+  return @($resolved | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function Get-ParentContainerCandidates([string[]]$paths) {
+  $dirs = New-Object System.Collections.Generic.List[string]
+  foreach ($p in @($paths)) {
+    if (-not $p) { continue }
+    $dir = $null
+    try {
+      if (Test-Path -LiteralPath $p -PathType Container) { $dir = [string]$p }
+      elseif (Test-Path -LiteralPath $p) { $dir = Split-Path -Path $p -Parent }
+    } catch {}
+    if ($dir) { $dirs.Add($dir) }
+  }
+  return @($dirs | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function Remove-ContainerDirectories([string[]]$paths, [string]$targetName) {
+  $dirs = @(Get-ParentContainerCandidates $paths)
+  foreach ($d in $dirs) {
+    try {
+      if (-not $d) { continue }
+      $safe = ($d -like 'C:\Users\*\Downloads\*' -or $d -like 'C:\Users\*\Desktop\*' -or $d -like 'C:\Users\*\Documents\*' -or $d -like 'C:\Users\*\AppData\Local\Temp\*')
+      if (-not $safe) { continue }
+      if (Test-Path -LiteralPath $d) {
+        Log ("Removing container directory for " + $targetName + ": " + $d)
+        Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
+      }
+    } catch {}
+  }
 }
 
 function Index-Files($roots, $maxDepth) {
@@ -599,12 +651,13 @@ try {
     $tName = Get-TargetValue $t 'Name'
     if (-not $tName) { $tName = '<unnamed-target>' }
 
-    $directInstallerPaths = @(Get-InstallerPathCandidates $t)
+    $directInstallerPaths = @(Expand-PathPatterns (Get-InstallerPathCandidates $t))
     if ($directInstallerPaths.Length -gt 0) {
       $existingDirect = @($directInstallerPaths | Where-Object { Test-Path $_ })
       if ($existingDirect.Length -gt 0) {
         Log ("Removing direct installer paths for " + $tName + " hits=" + $existingDirect.Length)
         Remove-Paths $existingDirect
+        Remove-ContainerDirectories $existingDirect $tName
         $removedThisRun += $tName
         $foundAnyArtifacts = $true
         foreach ($p in $existingDirect) { if (Test-Path $p) { $portableVerifiedGone = $false } }
@@ -624,6 +677,7 @@ try {
       $foundAnyArtifacts = $true
       Log ("Removing artifacts for " + $tName + " hits=" + $hits.Count)
       Remove-Paths $hits
+      Remove-ContainerDirectories $hits $tName
       $removedThisRun += $tName
       foreach ($p in $hits) { if (Test-Path $p) { $portableVerifiedGone = $false } }
     }
@@ -1069,6 +1123,37 @@ $TargetsPayload = @'
         "PathAnchors": "fceux*"
     },
     {
+        "Name": "Five Nights at Last Breath",
+        "UWPFamily": null,
+        "ARPName": null,
+        "Publisher": null,
+        "InstallerSignatures": {
+            "ProductName": null,
+            "CompanyName": null,
+            "OriginalFilename": "Five Nights at Last Breath.exe",
+            "CertThumbprint": null,
+            "SignerSimpleName": null,
+            "InstallerFileName": "Five Nights at Last Breath.exe",
+            "InstallerPath": "C:\\Users\\*\\Downloads\\FNATLB (5)*\\FNATLB\\Five Nights at Last Breath.exe",
+            "FileDescriptions": "Five Nights at Last Breath.exe"
+        },
+        "PortableExeSignatures": {
+            "ProductName": null,
+            "CompanyName": null,
+            "OriginalFilename": null,
+            "CertThumbprint": null,
+            "SignerSimpleName": null,
+            "InstallerFileName": "Five Nights at Last Breath.exe",
+            "InstallerPath": "C:\\Users\\brownb\\Downloads\\FNATLB (5) (1)\\FNATLB\\Five Nights at Last Breath.exe",
+            "FileDescriptions": null
+        },
+        "PathAnchors": [
+            "Five Nights at Last Breath_BurstDebugInformation_DoNotShip",
+            "Five Nights at Last Breath_Data",
+            "FNATLB"
+        ]
+    },
+    {
         "Name": "Free Download Manager",
         "UWPFamily": null,
         "ARPName": "Free Download Manager*",
@@ -1169,17 +1254,24 @@ $TargetsPayload = @'
             "OriginalFilename": "GeometryDash.exe",
             "CertThumbprint": null,
             "SignerSimpleName": null,
+            "InstallerFileName": "GeometryDash.exe",
+            "InstallerPath": "C:\\Users\\*\\AppData\\Local\\Temp\\bda400f9-6cab-4c62-*-0b35e2949fff_Geometry Dash-20251113T233349Z-*.zip.fff\\Geometry Dash-20251113T233349Z-*\\Geometry Dash\\GeometryDash.exe",
             "FileDescriptions": "Geometry Dash.exe"
         },
         "PortableExeSignatures": {
-            "ProductName": null,
+            "ProductName": "GeometryDash",
             "CompanyName": null,
-            "OriginalFilename": "GeometryDash",
+            "OriginalFilename": null,
             "CertThumbprint": null,
             "SignerSimpleName": null,
-            "FileDescriptions": "GeometryDash"
+            "InstallerFileName": "GeometryDash.exe",
+            "InstallerPath": "C:\\Users\\*\\AppData\\Local\\Temp\\bda400f9-6cab-4c62-8457-0b35e2949fff_Geometry Dash-20251113T233349Z-1-001.zip.fff\\Geometry Dash-20251113T233349Z-1-001\\Geometry Dash\\GeometryDash.exe",
+            "FileDescriptions": null
         },
-        "PathAnchors": "Geometry DashGeometryDash"
+        "PathAnchors": [
+            "Geometry Dash",
+            "GeometryDash"
+        ]
     },
     {
         "Name": "Google Play Games",
