@@ -1,7 +1,7 @@
 <#
 RSD CleanAgent - Intune Proactive Remediation Remediation
 PowerShell 5.1 compatible
-Version: 2026.03.06.2
+Version: 2026.03.06.3
 
 Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
 #>
@@ -20,12 +20,12 @@ $VersionFile = Join-Path $AgentRoot 'version.txt'
 $StateFile   = Join-Path $AgentRoot 'state.json'
 $LogDir      = Join-Path $AgentRoot 'Logs'
 
-$ThisVersion = '2026.03.06.2'
+$ThisVersion = '2026.03.06.3'
 
 $AgentPayload = @'
 <#
 RSD CleanAgent (local) - PowerShell 5.1
-Version: 2026.03.06.2
+Version: 2026.03.06.3
 
 Behavior:
 - Batch inventory UWP/ARP once per run.
@@ -590,9 +590,22 @@ $mutexOwned = $false
 try {
   try {
     $mutex = New-Object System.Threading.Mutex($false, $mutexName)
-    $mutexOwned = $mutex.WaitOne(0, $false)
-    if (-not $mutexOwned) { return }
-  } catch {}
+    $mutexOwned = $mutex.WaitOne(15000, $false)
+    if (-not $mutexOwned) {
+      Log -m "Another cleanAGENT instance appears active (mutex busy >15s); exiting this run to avoid overlap." -lvl "WARN"
+      try {
+        $procs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'powershell' -and $_.CommandLine -match 'cleanAGENT.ps1' })
+        if ($procs.Length -gt 0) {
+          $plist = ($procs | ForEach-Object { ("PID={0}" -f $_.ProcessId) }) -join ', '
+          Log ("Potential active cleanAGENT processes: " + $plist)
+        }
+      } catch {}
+      $scriptExitCode = 1
+      return
+    }
+  } catch {
+    Log -m "Failed to initialize mutex; continuing best-effort." -lvl "WARN"
+  }
 
   $state = Read-JsonFile $StateFile @{ phase=0; phaseStart=(Get-Date).ToString('o'); lastDetect=(Get-Date).ToString('o'); lastRun=(Get-Date).ToString('o'); lastFound=@() }
   $state = Advance-PhaseIfTime $state
@@ -793,11 +806,6 @@ try {
   }
 
   Log ("cleanAGENT main completed with exit code " + $scriptExitCode)
-}
-catch {
-  $scriptExitCode = 1
-  $errText = $_ | Out-String
-  Log -m ("Unhandled exception in cleanAGENT main: " + $errText.Trim()) -lvl "ERROR"
 }
 catch {
   $scriptExitCode = 1
