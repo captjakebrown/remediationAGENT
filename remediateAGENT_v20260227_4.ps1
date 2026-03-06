@@ -799,6 +799,11 @@ catch {
   $errText = $_ | Out-String
   Log -m ("Unhandled exception in cleanAGENT main: " + $errText.Trim()) -lvl "ERROR"
 }
+catch {
+  $scriptExitCode = 1
+  $errText = $_ | Out-String
+  Log -m ("Unhandled exception in cleanAGENT main: " + $errText.Trim()) -lvl "ERROR"
+}
 finally {
   if ($mutexOwned -and $mutex) {
     try { $mutex.ReleaseMutex() | Out-Null } catch {}
