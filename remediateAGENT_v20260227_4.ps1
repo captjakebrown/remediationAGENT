@@ -1,7 +1,7 @@
 <#
 RSD CleanAgent - Intune Proactive Remediation Remediation
 PowerShell 5.1 compatible
-Version: 2026.03.09.2
+Version: 2026.03.09.3
 
 Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
 #>
@@ -20,12 +20,12 @@ $VersionFile = Join-Path $AgentRoot 'version.txt'
 $StateFile   = Join-Path $AgentRoot 'state.json'
 $LogDir      = Join-Path $AgentRoot 'Logs'
 
-$ThisVersion = '2026.03.09.2'
+$ThisVersion = '2026.03.09.3'
 
 $AgentPayload = @'
 <#
 RSD CleanAgent (local) - PowerShell 5.1
-Version: 2026.03.09.2
+Version: 2026.03.09.3
 
 Behavior:
 - Batch inventory UWP/ARP once per run.
@@ -451,126 +451,28 @@ function Build-Stems($t) {
       }
     }
   }
-  return @($stems | Where-Object { $_ -and $_.Length -ge 4 } | Select-Object -Unique | Select-Object -First 30)
+  return @($stems | Where-Object { $_ -and $_.Length -ge 4 } | Select-Object -Unique | Select-Object -First 10)
 }
 
-
-function Get-InstallerPathCandidates($t) {
-  $paths = New-Object System.Collections.Generic.List[string]
-  foreach ($sig in @($t.PortableExeSignatures, $t.InstallerSignatures)) {
+function Get-InstallerPatternCandidates($t) {
+  # Backward-compat helper: older deployed cleanAGENT variants may invoke this
+  # during residual evaluation. Keep it present and deterministic.
+  if (-not $t) { return @() }
+  $out = New-Object System.Collections.Generic.List[string]
+  foreach ($sig in @($t.InstallerSignatures, $t.PortableExeSignatures)) {
     if (-not $sig) { continue }
-    $p = Get-SignatureValue $sig "InstallerPath"
-    if (-not $p) { continue }
-    if ($p -is [System.Array]) {
-      foreach ($one in $p) { if ($one) { $paths.Add([string]$one) } }
-    } else {
-      $paths.Add([string]$p)
+    foreach ($v in @($sig.OriginalFilename, $sig.InstallerFileName, $sig.ProductName, $sig.CompanyName)) {
+      if (-not $v) { continue }
+      $s = $v.ToString().Trim()
+      if (-not $s) { continue }
+      if ($s -match '[\*\?]') { $out.Add($s) }
+      else {
+        $clean = ($s -replace '[\s\._-]+','*')
+        if ($clean -and $clean.Length -ge 4) { $out.Add("*" + $clean + "*") }
+      }
     }
   }
-  return @($paths | Where-Object { $_ } | Select-Object -Unique)
-}
-
-function Expand-PathPatterns([string[]]$patterns) {
-  $resolved = New-Object System.Collections.Generic.List[string]
-  foreach ($pattern in @($patterns)) {
-    if (-not $pattern) { continue }
-    try {
-      $items = @(Get-Item -Path ([string]$pattern) -Force -ErrorAction SilentlyContinue)
-      foreach ($it in $items) {
-        if ($it -and $it.FullName) { $resolved.Add([string]$it.FullName) }
-      }
-    } catch {}
-    try {
-      if (Test-Path -LiteralPath ([string]$pattern)) { $resolved.Add([string]$pattern) }
-    } catch {}
-  }
-  return @($resolved | Where-Object { $_ } | Select-Object -Unique)
-}
-
-function Get-ParentContainerCandidates([string[]]$paths) {
-  $dirs = New-Object System.Collections.Generic.List[string]
-  foreach ($p in @($paths)) {
-    if (-not $p) { continue }
-    $dir = $null
-    try {
-      if (Test-Path -LiteralPath $p -PathType Container) { $dir = [string]$p }
-      elseif (Test-Path -LiteralPath $p) { $dir = Split-Path -Path $p -Parent }
-    } catch {}
-    if ($dir) { $dirs.Add($dir) }
-  }
-  return @($dirs | Where-Object { $_ } | Select-Object -Unique)
-}
-
-function Remove-ContainerDirectories([string[]]$paths, [string]$targetName, [string[]]$stems) {
-  $dirs = @(Get-ParentContainerCandidates $paths)
-  $stems = @($stems)
-  foreach ($d in $dirs) {
-    try {
-      if (-not $d) { continue }
-
-      # Never remove well-known user roots; only subdirectories.
-      if ($d -like 'C:\Users\*\Downloads' -or $d -like 'C:\Users\*\Desktop' -or $d -like 'C:\Users\*\Documents' -or $d -like 'C:\Users\*\AppData\Local\Temp') {
-        continue
-      }
-
-      $safe = ($d -like 'C:\Users\*\Downloads\*' -or $d -like 'C:\Users\*\Desktop\*' -or $d -like 'C:\Users\*\Documents\*' -or $d -like 'C:\Users\*\AppData\Local\Temp\*')
-      if (-not $safe) { continue }
-
-      # Reduce overbroad deletions: require target/stem/path-anchor hint in folder path.
-      $dn = [string]$d
-      $looksRelated = $false
-      foreach ($s in $stems) {
-        if (-not $s) { continue }
-        $needle = ([string]$s).ToLowerInvariant().Replace('*','').Replace('?','')
-        if ($needle.Length -lt 4) { continue }
-        if ($dn.ToLowerInvariant().Contains($needle)) { $looksRelated = $true; break }
-      }
-      if (-not $looksRelated -and $targetName) {
-        $tn = ([string]$targetName).ToLowerInvariant().Replace('*','').Replace('?','')
-        if ($tn.Length -ge 4 -and $dn.ToLowerInvariant().Contains($tn)) { $looksRelated = $true }
-      }
-      if (-not $looksRelated) { continue }
-
-      if (Test-Path -LiteralPath $d) {
-        Log ("Removing container directory for " + $targetName + ": " + $d)
-        Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
-      }
-    } catch {}
-  }
-}
-
-
-function Remove-MatchingTopLevelDirs([string[]]$bases, [string[]]$stems, [string]$targetName) {
-  $removed = 0
-  $stems = @($stems | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant().Replace('*','').Replace('?','') } | Where-Object { $_.Length -ge 5 } | Select-Object -Unique)
-  if ($stems.Length -eq 0) { return 0 }
-
-  foreach ($b in @($bases)) {
-    if (-not $b) { continue }
-    if (-not (Test-Path -LiteralPath $b -PathType Container)) { continue }
-    try {
-      $dirs = @(Get-ChildItem -LiteralPath $b -Directory -Force -ErrorAction SilentlyContinue)
-      foreach ($d in $dirs) {
-        $dn = $d.Name.ToLowerInvariant()
-        $isMatch = $false
-        foreach ($s in $stems) {
-          if ($dn.Contains($s)) { $isMatch = $true; break }
-        }
-        if (-not $isMatch) { continue }
-
-        # Keep this conservative: avoid deleting whole profile roots.
-        if ($d.FullName -like 'C:\Users\*\AppData\*' -or $d.FullName -like 'C:\Program Files*\*') {
-          Log ("Removing top-level app directory for " + $targetName + ": " + $d.FullName)
-          try {
-            Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction SilentlyContinue
-            $removed += 1
-          } catch {}
-        }
-      }
-    } catch {}
-  }
-
-  return $removed
+  return @($out | Where-Object { $_ } | Sort-Object -Unique | Select-Object -First 20)
 }
 
 function Index-Files($roots, $maxDepth) {
@@ -902,40 +804,8 @@ try {
   $residualTotalHits = 0
 
   foreach ($t in $residual) {
-    $residualEvaluated += 1
-    $tName = Get-TargetValue $t 'Name'
-    if (-not $tName) { $tName = '<unnamed-target>' }
     $stems = @(Build-Stems $t)
-    Log ("Residual evaluation: " + $tName + " stems=" + $stems.Length)
-    $targetHitCount = 0
-
-    $installerPatterns = @(Get-InstallerPatternCandidates $t)
-    $installerHits = @(Find-InstallerFiles $fileIndex $installerPatterns)
-    if ($installerHits.Length -gt 0) {
-      Log ("Removing installer artifacts for " + $tName + " hits=" + $installerHits.Length)
-      Remove-Paths $installerHits
-      Remove-ContainerDirectories $installerHits $tName $stems
-      $removedThisRun += $tName
-      $foundAnyArtifacts = $true
-      $targetHitCount += $installerHits.Length
-      foreach ($p in $installerHits) { if (Test-Path $p) { $portableVerifiedGone = $false } }
-    }
-
-    $directInstallerPaths = @(Expand-PathPatterns (Get-InstallerPathCandidates $t))
-    if ($directInstallerPaths.Length -gt 0) {
-      $existingDirect = @($directInstallerPaths | Where-Object { Test-Path $_ })
-      if ($existingDirect.Length -gt 0) {
-        Log ("Removing direct installer paths for " + $tName + " hits=" + $existingDirect.Length)
-        Remove-Paths $existingDirect
-        Remove-ContainerDirectories $existingDirect $tName $stems
-        $removedThisRun += $tName
-        $foundAnyArtifacts = $true
-        $targetHitCount += $existingDirect.Length
-        foreach ($p in $existingDirect) { if (Test-Path $p) { $portableVerifiedGone = $false } }
-      }
-    }
-
-    if ($stems.Length -eq 0) { continue }
+    if (-not $stems -or $stems.Count -eq 0) { continue }
     if ($activeUser) {
       $shortcutRemoved = Remove-QuickLaunchMatches $activeUser $stems
       if ($shortcutRemoved) {
