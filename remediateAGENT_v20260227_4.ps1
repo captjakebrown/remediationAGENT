@@ -38,7 +38,7 @@ Behavior:
     Phase 2: every 4h for next 24h
     Phase 3: once daily at 09:00 local IF clean; if forbidden apps detected, reset to Phase 0.
 - Writes debug log to C:\ProgramData\RSD\Agent\Logs
-- Writes receipt RSD ATTN.log on user desktop (OneDrive Desktop preferred), ACL-hardened and readable by Users.
+- Writes receipt RSD ATTN.log to Public Desktop (primary) and active user Desktop fallback, ACL-hardened read-only for standard users.
 
 Runs as SYSTEM via Task Scheduler.
 #>
@@ -180,45 +180,70 @@ function Get-ActiveUser() {
   return $null
 }
 
-function Get-DesktopPathForUser([string]$user) {
-  if (-not $user) { return $null }
-  $one = "C:\Users\{0}\OneDrive - Riverview School District\Desktop" -f $user
-  $loc = "C:\Users\{0}\Desktop" -f $user
-  if (Test-Path $one) { return $one }
-  if (Test-Path $loc) { return $loc }
-  return $null
+function Get-ReceiptDesktopPaths([string]$user) {
+  $paths = @('C:\Users\Public\Desktop')
+  if ($user) {
+    $one = "C:\Users\{0}\OneDrive - Riverview School District\Desktop" -f $user
+    $loc = "C:\Users\{0}\Desktop" -f $user
+    if (Test-Path $one) { $paths += $one }
+    if (Test-Path $loc) { $paths += $loc }
+  }
+  return @($paths | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique)
 }
 
 function Ensure-ReceiptAcl([string]$p) {
   try { (Get-Item $p -ErrorAction SilentlyContinue).Attributes = 'ReadOnly' } catch {}
   try {
     icacls $p /inheritance:r | Out-Null
-    icacls $p /grant:r "Users:(R)" "Authenticated Users:(R)" "Everyone:(R)" "Administrators:(F)" "SYSTEM:(F)" | Out-Null
+    icacls $p /grant:r "SYSTEM:(F)" "Administrators:(F)" "Users:(RX)" "Authenticated Users:(RX)" | Out-Null
+    icacls $p /deny "Users:(W,M,WDAC,WO,D,DC)" | Out-Null
+    icacls $p /deny "Authenticated Users:(W,M,WDAC,WO,D,DC)" | Out-Null
   } catch {}
 }
 
-function Update-Receipt([string[]]$removedApps) {
-  $removedApps = @($removedApps)
-  if ($removedApps.Length -eq 0) { return }
-  $user = Get-ActiveUser
-  $desk = Get-DesktopPathForUser $user
-  if (-not $desk) { return }
-  $receipt = Join-Path $desk 'RSD ATTN.log'
+function Write-ReceiptFile([string]$receipt, [string]$listText) {
+  if (-not $receipt) { return }
   $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-  $list = ($removedApps | Sort-Object -Unique) -join ', '
-  $line = "$ts - Removed: $list"
+  $line = "$ts - Removed: $listText"
   if (-not (Test-Path $receipt)) {
     try {
       Set-Content -Path $receipt -Value "Forbidden software has been removed from your computer." -Encoding UTF8
-      Add-Content -Path $receipt -Value ("Removed: " + $list) -Encoding UTF8
+      Add-Content -Path $receipt -Value ("Removed: " + $listText) -Encoding UTF8
       Add-Content -Path $receipt -Value "If additional forbidden software is discovered in the future, school administration will determine appropriate discipline." -Encoding UTF8
       Add-Content -Path $receipt -Value "" -Encoding UTF8
       Add-Content -Path $receipt -Value $line -Encoding UTF8
     } catch {}
   } else {
-    try { Add-Content -Path $receipt -Value $line -Encoding UTF8 } catch {}
+    try {
+      $raw = Get-Content -LiteralPath $receipt -Raw -ErrorAction SilentlyContinue
+      if (-not $raw) {
+        Set-Content -Path $receipt -Value "Forbidden software has been removed from your computer." -Encoding UTF8
+      }
+      if ($raw -notmatch '(?i)If additional forbidden software is discovered in the future') {
+        Add-Content -Path $receipt -Value "If additional forbidden software is discovered in the future, school administration will determine appropriate discipline." -Encoding UTF8
+      }
+      Add-Content -Path $receipt -Value $line -Encoding UTF8
+    } catch {}
   }
   Ensure-ReceiptAcl $receipt
+}
+
+function Update-Receipt([string[]]$removedApps, [string[]]$detectedApps) {
+  $candidate = @()
+  $candidate += (To-StringArray $removedApps)
+  if ($candidate.Count -eq 0) { $candidate += (To-StringArray $detectedApps) }
+  $candidate = @($candidate | Where-Object { $_ } | Sort-Object -Unique)
+  if ($candidate.Count -eq 0) { return }
+
+  $user = Get-ActiveUser
+  $desks = Get-ReceiptDesktopPaths $user
+  if (-not $desks -or $desks.Count -eq 0) { return }
+
+  $listText = ($candidate -join ', ')
+  foreach ($desk in $desks) {
+    $receipt = Join-Path $desk 'RSD ATTN.log'
+    Write-ReceiptFile -receipt $receipt -listText $listText
+  }
 }
 
 function Get-Targets() {
@@ -966,7 +991,7 @@ try {
     $state = Reset-Phase $state
     $state.lastDetect = (Get-Date).ToString('o')
     $state.lastFound = $foundAny
-    Update-Receipt ($removedThisRun | Select-Object -Unique)
+    Update-Receipt ($removedThisRun | Select-Object -Unique) ($foundThisRun | Select-Object -Unique)
   } else {
     $state = Advance-PhaseIfTime $state
   }
