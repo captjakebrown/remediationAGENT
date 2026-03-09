@@ -1,7 +1,7 @@
 <#
 RSD CleanAgent - Intune Proactive Remediation Remediation
 PowerShell 5.1 compatible
-Version: 2026.03.04.1
+Version: 2026.03.09.4
 
 Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
 #>
@@ -20,12 +20,12 @@ $VersionFile = Join-Path $AgentRoot 'version.txt'
 $StateFile   = Join-Path $AgentRoot 'state.json'
 $LogDir      = Join-Path $AgentRoot 'Logs'
 
-$ThisVersion = '2026.03.04.1'
+$ThisVersion = '2026.03.09.4'
 
 $AgentPayload = @'
 <#
 RSD CleanAgent (local) - PowerShell 5.1
-Version: 2026.03.04.1
+Version: 2026.03.09.4
 
 Behavior:
 - Batch inventory UWP/ARP once per run.
@@ -38,7 +38,7 @@ Behavior:
     Phase 2: every 4h for next 24h
     Phase 3: once daily at 09:00 local IF clean; if forbidden apps detected, reset to Phase 0.
 - Writes debug log to C:\ProgramData\RSD\Agent\Logs
-- Writes receipt RSD ATTN.log on user desktop (OneDrive Desktop preferred), ACL-hardened and readable by Users.
+- Writes receipt RSD ATTN.log to Public Desktop (primary) and active user Desktop fallback, ACL-hardened read-only for standard users.
 
 Runs as SYSTEM via Task Scheduler.
 #>
@@ -52,11 +52,16 @@ $StateFile   = Join-Path $AgentRoot 'state.json'
 $LogDir      = Join-Path $AgentRoot 'Logs'
 if (-not (Test-Path $LogDir)) { New-Item -Path $LogDir -ItemType Directory -Force | Out-Null }
 
-$logPath = Join-Path $LogDir ("cleanAGENT_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+$logPath = $null
 
 function Log([string]$m, [string]$lvl='INFO') {
   $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-  try { Add-Content -Path $logPath -Value ("{0} [{1}] {2}" -f $ts, $lvl, $m) -Encoding UTF8 } catch {}
+  try {
+    if (-not $script:logPath) {
+      $script:logPath = Join-Path $LogDir ("cleanAGENT_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    }
+    Add-Content -Path $script:logPath -Value ("{0} [{1}] {2}" -f $ts, $lvl, $m) -Encoding UTF8
+  } catch {}
 }
 
 function Read-JsonFile([string]$path, $fallback) {
@@ -175,45 +180,70 @@ function Get-ActiveUser() {
   return $null
 }
 
-function Get-DesktopPathForUser([string]$user) {
-  if (-not $user) { return $null }
-  $one = "C:\Users\{0}\OneDrive - Riverview School District\Desktop" -f $user
-  $loc = "C:\Users\{0}\Desktop" -f $user
-  if (Test-Path $one) { return $one }
-  if (Test-Path $loc) { return $loc }
-  return $null
+function Get-ReceiptDesktopPaths([string]$user) {
+  $paths = @('C:\Users\Public\Desktop')
+  if ($user) {
+    $one = "C:\Users\{0}\OneDrive - Riverview School District\Desktop" -f $user
+    $loc = "C:\Users\{0}\Desktop" -f $user
+    if (Test-Path $one) { $paths += $one }
+    if (Test-Path $loc) { $paths += $loc }
+  }
+  return @($paths | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique)
 }
 
 function Ensure-ReceiptAcl([string]$p) {
   try { (Get-Item $p -ErrorAction SilentlyContinue).Attributes = 'ReadOnly' } catch {}
   try {
     icacls $p /inheritance:r | Out-Null
-    icacls $p /grant:r "Users:(RX)" "Administrators:(F)" "SYSTEM:(F)" | Out-Null
-    icacls $p /deny "Users:(W,WDAC,WO,D,DC)" | Out-Null
+    icacls $p /grant:r "SYSTEM:(F)" "Administrators:(F)" "Users:(RX)" "Authenticated Users:(RX)" | Out-Null
+    icacls $p /deny "Users:(W,M,WDAC,WO,D,DC)" | Out-Null
+    icacls $p /deny "Authenticated Users:(W,M,WDAC,WO,D,DC)" | Out-Null
   } catch {}
 }
 
-function Update-Receipt([string[]]$removedApps) {
-  if (-not $removedApps -or $removedApps.Count -eq 0) { return }
-  $user = Get-ActiveUser
-  $desk = Get-DesktopPathForUser $user
-  if (-not $desk) { return }
-  $receipt = Join-Path $desk 'RSD ATTN.log'
+function Write-ReceiptFile([string]$receipt, [string]$listText) {
+  if (-not $receipt) { return }
   $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-  $list = ($removedApps | Sort-Object -Unique) -join ', '
-  $line = "$ts - Removed: $list"
+  $line = "$ts - Removed: $listText"
   if (-not (Test-Path $receipt)) {
     try {
       Set-Content -Path $receipt -Value "Forbidden software has been removed from your computer." -Encoding UTF8
-      Add-Content -Path $receipt -Value ("Removed: " + $list) -Encoding UTF8
+      Add-Content -Path $receipt -Value ("Removed: " + $listText) -Encoding UTF8
       Add-Content -Path $receipt -Value "If additional forbidden software is discovered in the future, school administration will determine appropriate discipline." -Encoding UTF8
       Add-Content -Path $receipt -Value "" -Encoding UTF8
       Add-Content -Path $receipt -Value $line -Encoding UTF8
     } catch {}
   } else {
-    try { Add-Content -Path $receipt -Value $line -Encoding UTF8 } catch {}
+    try {
+      $raw = Get-Content -LiteralPath $receipt -Raw -ErrorAction SilentlyContinue
+      if (-not $raw) {
+        Set-Content -Path $receipt -Value "Forbidden software has been removed from your computer." -Encoding UTF8
+      }
+      if ($raw -notmatch '(?i)If additional forbidden software is discovered in the future') {
+        Add-Content -Path $receipt -Value "If additional forbidden software is discovered in the future, school administration will determine appropriate discipline." -Encoding UTF8
+      }
+      Add-Content -Path $receipt -Value $line -Encoding UTF8
+    } catch {}
   }
   Ensure-ReceiptAcl $receipt
+}
+
+function Update-Receipt([string[]]$removedApps, [string[]]$detectedApps) {
+  $candidate = @()
+  $candidate += (To-StringArray $removedApps)
+  if ($candidate.Count -eq 0) { $candidate += (To-StringArray $detectedApps) }
+  $candidate = @($candidate | Where-Object { $_ } | Sort-Object -Unique)
+  if ($candidate.Count -eq 0) { return }
+
+  $user = Get-ActiveUser
+  $desks = Get-ReceiptDesktopPaths $user
+  if (-not $desks -or $desks.Count -eq 0) { return }
+
+  $listText = ($candidate -join ', ')
+  foreach ($desk in $desks) {
+    $receipt = Join-Path $desk 'RSD ATTN.log'
+    Write-ReceiptFile -receipt $receipt -listText $listText
+  }
 }
 
 function Get-Targets() {
@@ -243,6 +273,52 @@ function Snapshot-Arp() {
 function Match-Arp($arpList, $pattern) {
   if (-not $pattern) { return @() }
   return @($arpList | Where-Object { $_.DisplayName -like $pattern })
+}
+
+function Remove-ArpUninstallEntriesByPattern([string]$pattern) {
+  if (-not $pattern) { return 0 }
+
+  $removedCount = 0
+  $roots = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+  )
+
+  try {
+    Get-ChildItem -Path Registry::HKEY_USERS -ErrorAction SilentlyContinue | ForEach-Object {
+      $sid = $_.PSChildName
+      if ($sid -and ($sid -notmatch '_Classes$')) {
+        $roots += ("Registry::HKEY_USERS\{0}\Software\Microsoft\Windows\CurrentVersion\Uninstall" -f $sid)
+        $roots += ("Registry::HKEY_USERS\{0}\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall" -f $sid)
+      }
+    }
+  } catch {}
+
+  foreach ($root in ($roots | Select-Object -Unique)) {
+    try {
+      Get-ChildItem -Path $root -ErrorAction SilentlyContinue | ForEach-Object {
+        $k = $_
+        $dn = $null
+        try {
+          $props = Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue
+          if ($props) { $dn = $props.DisplayName }
+        } catch {}
+
+        if (-not $dn) { continue }
+        if ($dn -like $pattern) {
+          try {
+            Remove-Item -LiteralPath $k.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+            if (-not (Test-Path -LiteralPath $k.PSPath)) {
+              $removedCount++
+              Log ("Removed ARP uninstall registry key: " + $k.PSPath)
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+
+  return $removedCount
 }
 
 function Get-TargetValue($target, [string]$name) {
@@ -335,7 +411,28 @@ function Build-Stems($t) {
       } catch {}
     }
   }
-  return ($stems | Where-Object { $_ -and $_.Length -ge 4 } | Select-Object -Unique | Select-Object -First 10)
+  return @($stems | Where-Object { $_ -and $_.Length -ge 4 } | Select-Object -Unique | Select-Object -First 10)
+}
+
+function Get-InstallerPatternCandidates($t) {
+  # Backward-compat helper: older deployed cleanAGENT variants may invoke this
+  # during residual evaluation. Keep it present and deterministic.
+  if (-not $t) { return @() }
+  $out = New-Object System.Collections.Generic.List[string]
+  foreach ($sig in @($t.InstallerSignatures, $t.PortableExeSignatures)) {
+    if (-not $sig) { continue }
+    foreach ($v in @($sig.OriginalFilename, $sig.InstallerFileName, $sig.ProductName, $sig.CompanyName)) {
+      if (-not $v) { continue }
+      $s = $v.ToString().Trim()
+      if (-not $s) { continue }
+      if ($s -match '[\*\?]') { $out.Add($s) }
+      else {
+        $clean = ($s -replace '[\s\._-]+','*')
+        if ($clean -and $clean.Length -ge 4) { $out.Add("*" + $clean + "*") }
+      }
+    }
+  }
+  return @($out | Where-Object { $_ } | Sort-Object -Unique | Select-Object -First 20)
 }
 
 function Index-Files($roots, $maxDepth) {
@@ -379,7 +476,7 @@ function Find-MatchingFiles($fileIndex, [string[]]$stems) {
       else { if ($k -like ('*' + $ss + '*')) { $hits += $fileIndex[$k] } }
     }
   }
-  return ($hits | Select-Object -Unique)
+  return @($hits | Select-Object -Unique)
 }
 
 function Remove-Paths([string[]]$paths) {
@@ -415,19 +512,119 @@ function Remove-QuickLaunchMatches([string]$user, [string[]]$stems) {
   return $removed
 }
 
+
+function To-StringArray($v) {
+  if ($null -eq $v) { return @() }
+  if ($v -is [string]) { return @($v) }
+  if ($v -is [System.Collections.IEnumerable]) {
+    $out = @()
+    foreach ($i in $v) { if ($null -ne $i) { $out += $i.ToString() } }
+    return @($out)
+  }
+  return @($v.ToString())
+}
+
+function Normalize-PathAnchors($v) {
+  $raw = @()
+  foreach ($item in (To-StringArray $v)) {
+    if (-not $item) { continue }
+    foreach ($piece in ([regex]::Split($item, '[,;\r\n]+'))) {
+      $p = $piece.Trim()
+      if ($p) { $raw += $p }
+    }
+  }
+  return @($raw | Sort-Object -Unique)
+}
+
+function Remove-DesktopShortcuts([string[]]$stems) {
+  if (-not $stems -or $stems.Count -eq 0) { return $false }
+  $roots = @('C:\Users\Public\Desktop')
+  try {
+    Get-ChildItem -Path 'C:\Users' -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
+      $roots += (Join-Path $_.FullName 'Desktop')
+      try {
+        Get-ChildItem -Path $_.FullName -Directory -Force -ErrorAction SilentlyContinue |
+          Where-Object { $_.Name -like 'OneDrive*' } |
+          ForEach-Object { $roots += (Join-Path $_.FullName 'Desktop') }
+      } catch {}
+    }
+  } catch {}
+  $roots = $roots | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+
+  $removed = $false
+  foreach ($r in $roots) {
+    try {
+      Get-ChildItem -LiteralPath $r -File -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -in @('.lnk','.url','.website','.appref-ms') } |
+        ForEach-Object {
+          $n = $_.Name.ToLowerInvariant()
+          foreach ($s in $stems) {
+            $needle = $s.ToLowerInvariant()
+            if ($needle.Length -lt 4) { continue }
+            if ($n -like ('*' + $needle + '*')) {
+              try {
+                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                $removed = $true
+                Log ("Removed desktop shortcut: " + $_.FullName)
+              } catch {}
+              break
+            }
+          }
+        }
+    } catch {}
+  }
+  return $removed
+}
+
+function Find-AnchorDirectories($roots, [string[]]$anchors, [int]$maxDepth = 3) {
+  $hits = New-Object System.Collections.Generic.List[string]
+  if (-not $anchors -or $anchors.Count -eq 0) { return @() }
+  $searchRoots = @()
+  $searchRoots += ($roots | Where-Object { $_ -and (Test-Path $_) })
+  $searchRoots += @('C:\ProgramData','C:\Program Files','C:\Program Files (x86)','C:\Users')
+  $searchRoots = $searchRoots | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+
+  foreach ($r in $searchRoots) {
+    $q = New-Object System.Collections.Queue
+    $q.Enqueue(@($r,0))
+    while ($q.Count -gt 0) {
+      $it = $q.Dequeue(); $p=$it[0]; $d=[int]$it[1]
+      $dirs = @()
+      try { $dirs = Get-ChildItem -LiteralPath $p -Directory -Force -ErrorAction SilentlyContinue } catch {}
+      foreach ($dir in $dirs) {
+        $name = $dir.Name
+        $match = $false
+        foreach ($a in $anchors) {
+          if (-not $a) { continue }
+          if ($a.Contains('*') -or $a.Contains('?')) {
+            if ($name -like $a) { $match = $true; break }
+          } else {
+            if ($name -ieq $a) { $match = $true; break }
+          }
+        }
+        if ($match) { [void]$hits.Add($dir.FullName); continue }
+        if ($d -lt $maxDepth) { $q.Enqueue(@($dir.FullName, $d+1)) }
+      }
+    }
+  }
+
+  # Keep only root-most directories to avoid redundant deep deletions.
+  $uniq = @($hits | Sort-Object -Unique)
+  $top = New-Object System.Collections.Generic.List[string]
+  foreach ($h in $uniq) {
+    $isChild = $false
+    foreach ($k in $top) {
+      if ($h.StartsWith($k + '\', [System.StringComparison]::OrdinalIgnoreCase)) { $isChild = $true; break }
+    }
+    if (-not $isChild) { [void]$top.Add($h) }
+  }
+  return @($top)
+}
+
 # MAIN
 $scriptExitCode = 0
-$mutexName = 'Global\\RSDCleanAgentMutex'
-$mutex = $null
-$mutexOwned = $false
 
 try {
-  try {
-    $mutex = New-Object System.Threading.Mutex($false, $mutexName)
-    $mutexOwned = $mutex.WaitOne(0, $false)
-    if (-not $mutexOwned) { return }
-  } catch {}
-
   $state = Read-JsonFile $StateFile @{ phase=0; phaseStart=(Get-Date).ToString('o'); lastDetect=(Get-Date).ToString('o'); lastRun=(Get-Date).ToString('o'); lastFound=@() }
   $state = Advance-PhaseIfTime $state
 
@@ -497,6 +694,13 @@ try {
       if ($did) { $removedThisRun += $tName }
     }
 
+    if ($did -and $tArpName) {
+      $arpKeysRemoved = Remove-ArpUninstallEntriesByPattern $tArpName
+      if ($arpKeysRemoved -gt 0) {
+        Log ("ARP uninstall entries removed for pattern '" + $tArpName + "': " + $arpKeysRemoved)
+      }
+    }
+
     if ($did) { $removedThisRun += $tName }
   }
   Log "Completed Pass 1"
@@ -544,7 +748,7 @@ try {
   $foundAnyArtifacts = $false
 
   foreach ($t in $residual) {
-    $stems = Build-Stems $t
+    $stems = @(Build-Stems $t)
     if (-not $stems -or $stems.Count -eq 0) { continue }
     if ($activeUser) {
       $shortcutRemoved = Remove-QuickLaunchMatches $activeUser $stems
@@ -554,7 +758,13 @@ try {
         $removedThisRun += $tName
       }
     }
-    $hits = Find-MatchingFiles $fileIndex $stems
+    $deskShortcutRemoved = Remove-DesktopShortcuts $stems
+    if ($deskShortcutRemoved) {
+      $tName = Get-TargetValue $t 'Name'
+      if (-not $tName) { $tName = '<unnamed-target>' }
+      $removedThisRun += $tName
+    }
+    $hits = @(Find-MatchingFiles $fileIndex $stems)
     if ($hits.Count -gt 0) {
       $foundAnyArtifacts = $true
       $tName = Get-TargetValue $t 'Name'
@@ -564,14 +774,38 @@ try {
       $removedThisRun += $tName
       foreach ($p in $hits) { if (Test-Path $p) { $portableVerifiedGone = $false } }
     }
+
+    $anchors = Normalize-PathAnchors (Get-TargetValue $t 'PathAnchors')
+    if ($anchors.Count -gt 0) {
+      $anchorDirs = Find-AnchorDirectories -roots $roots -anchors $anchors -maxDepth 3
+      if ($anchorDirs.Count -gt 0) {
+        $foundAnyArtifacts = $true
+        $tName = Get-TargetValue $t 'Name'
+        if (-not $tName) { $tName = '<unnamed-target>' }
+        Log ("Removing anchor directories for " + $tName + " dirs=" + $anchorDirs.Count)
+        Remove-Paths $anchorDirs
+        $removedThisRun += $tName
+        foreach ($d in $anchorDirs) { if (Test-Path $d) { $portableVerifiedGone = $false } }
+      }
+    }
+
+    $tArpNameResidual = Get-TargetValue $t 'ARPName'
+    if ($tArpNameResidual -and ($hits.Count -gt 0 -or $anchors.Count -gt 0 -or $deskShortcutRemoved -or ($activeUser -and $shortcutRemoved))) {
+      $arpKeysRemoved2 = Remove-ArpUninstallEntriesByPattern $tArpNameResidual
+      if ($arpKeysRemoved2 -gt 0) {
+        $tName = Get-TargetValue $t 'Name'
+        if (-not $tName) { $tName = '<unnamed-target>' }
+        Log ("Removed residual ARP uninstall entries for " + $tName + " count=" + $arpKeysRemoved2)
+      }
+    }
   }
 
-  $foundAny = ($foundThisRun | Select-Object -Unique)
+  $foundAny = @($foundThisRun | Select-Object -Unique)
   if ($foundAny.Count -gt 0 -or $foundAnyArtifacts) {
     $state = Reset-Phase $state
     $state.lastDetect = (Get-Date).ToString('o')
     $state.lastFound = $foundAny
-    Update-Receipt ($removedThisRun | Select-Object -Unique)
+    Update-Receipt ($removedThisRun | Select-Object -Unique) ($foundThisRun | Select-Object -Unique)
   } else {
     $state = Advance-PhaseIfTime $state
   }
@@ -590,12 +824,6 @@ catch {
   Log -m ("Unhandled exception in cleanAGENT main: " + $errText.Trim()) -lvl "ERROR"
 }
 finally {
-  if ($mutexOwned -and $mutex) {
-    try { $mutex.ReleaseMutex() | Out-Null } catch {}
-  }
-  if ($mutex) {
-    try { $mutex.Dispose() } catch {}
-  }
 }
 
 exit $scriptExitCode
