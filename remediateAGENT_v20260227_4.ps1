@@ -1,7 +1,7 @@
 <#
 RSD CleanAgent - Intune Proactive Remediation Remediation
 PowerShell 5.1 compatible
-Version: 2026.03.09.3
+Version: 2026.03.09.4
 
 Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
 #>
@@ -20,12 +20,12 @@ $VersionFile = Join-Path $AgentRoot 'version.txt'
 $StateFile   = Join-Path $AgentRoot 'state.json'
 $LogDir      = Join-Path $AgentRoot 'Logs'
 
-$ThisVersion = '2026.03.09.3'
+$ThisVersion = '2026.03.09.4'
 
 $AgentPayload = @'
 <#
 RSD CleanAgent (local) - PowerShell 5.1
-Version: 2026.03.09.3
+Version: 2026.03.09.4
 
 Behavior:
 - Batch inventory UWP/ARP once per run.
@@ -472,6 +472,27 @@ function Get-InstallerPatternCandidates($t) {
       }
     }
   }
+  return @($stems | Where-Object { $_ -and $_.Length -ge 4 } | Select-Object -Unique | Select-Object -First 10)
+}
+
+function Get-InstallerPatternCandidates($t) {
+  # Backward-compat helper: older deployed cleanAGENT variants may invoke this
+  # during residual evaluation. Keep it present and deterministic.
+  if (-not $t) { return @() }
+  $out = New-Object System.Collections.Generic.List[string]
+  foreach ($sig in @($t.InstallerSignatures, $t.PortableExeSignatures)) {
+    if (-not $sig) { continue }
+    foreach ($v in @($sig.OriginalFilename, $sig.InstallerFileName, $sig.ProductName, $sig.CompanyName)) {
+      if (-not $v) { continue }
+      $s = $v.ToString().Trim()
+      if (-not $s) { continue }
+      if ($s -match '[\*\?]') { $out.Add($s) }
+      else {
+        $clean = ($s -replace '[\s\._-]+','*')
+        if ($clean -and $clean.Length -ge 4) { $out.Add("*" + $clean + "*") }
+      }
+    }
+  }
   return @($out | Where-Object { $_ } | Sort-Object -Unique | Select-Object -First 20)
 }
 
@@ -517,7 +538,7 @@ function Find-MatchingFiles($fileIndex, [string[]]$stems) {
       else { if ($k -like ('*' + $ss + '*')) { $hits += $fileIndex[$k] } }
     }
   }
-  return ($hits | Select-Object -Unique)
+  return @($hits | Select-Object -Unique)
 }
 
 function Remove-Paths([string[]]$paths) {
@@ -818,7 +839,7 @@ try {
       if (-not $tName) { $tName = '<unnamed-target>' }
       $removedThisRun += $tName
     }
-    $hits = Find-MatchingFiles $fileIndex $stems
+    $hits = @(Find-MatchingFiles $fileIndex $stems)
     if ($hits.Count -gt 0) {
       $foundAnyArtifacts = $true
       $targetHitCount += $hits.Length
@@ -854,10 +875,8 @@ try {
     }
   }
 
-  Log ("Residual pass complete. evaluated=" + $residualEvaluated + " withHits=" + $residualWithHits + " totalHits=" + $residualTotalHits)
-
   $foundAny = @($foundThisRun | Select-Object -Unique)
-  if ($foundAny.Length -gt 0 -or $foundAnyArtifacts) {
+  if ($foundAny.Count -gt 0 -or $foundAnyArtifacts) {
     $state = Reset-Phase $state
     $state.lastDetect = (Get-Date).ToString('o')
     $state.lastFound = $foundAny
