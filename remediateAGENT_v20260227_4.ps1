@@ -1,7 +1,7 @@
 <#
 RSD CleanAgent - Intune Proactive Remediation Remediation
 PowerShell 5.1 compatible
-Version: 2026.03.09.1
+Version: 2026.03.09.2
 
 Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
 #>
@@ -20,12 +20,12 @@ $VersionFile = Join-Path $AgentRoot 'version.txt'
 $StateFile   = Join-Path $AgentRoot 'state.json'
 $LogDir      = Join-Path $AgentRoot 'Logs'
 
-$ThisVersion = '2026.03.09.1'
+$ThisVersion = '2026.03.09.2'
 
 $AgentPayload = @'
 <#
 RSD CleanAgent (local) - PowerShell 5.1
-Version: 2026.03.09.1
+Version: 2026.03.09.2
 
 Behavior:
 - Batch inventory UWP/ARP once per run.
@@ -248,6 +248,52 @@ function Snapshot-Arp() {
 function Match-Arp($arpList, $pattern) {
   if (-not $pattern) { return @() }
   return @($arpList | Where-Object { $_.DisplayName -like $pattern })
+}
+
+function Remove-ArpUninstallEntriesByPattern([string]$pattern) {
+  if (-not $pattern) { return 0 }
+
+  $removedCount = 0
+  $roots = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+  )
+
+  try {
+    Get-ChildItem -Path Registry::HKEY_USERS -ErrorAction SilentlyContinue | ForEach-Object {
+      $sid = $_.PSChildName
+      if ($sid -and ($sid -notmatch '_Classes$')) {
+        $roots += ("Registry::HKEY_USERS\{0}\Software\Microsoft\Windows\CurrentVersion\Uninstall" -f $sid)
+        $roots += ("Registry::HKEY_USERS\{0}\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall" -f $sid)
+      }
+    }
+  } catch {}
+
+  foreach ($root in ($roots | Select-Object -Unique)) {
+    try {
+      Get-ChildItem -Path $root -ErrorAction SilentlyContinue | ForEach-Object {
+        $k = $_
+        $dn = $null
+        try {
+          $props = Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue
+          if ($props) { $dn = $props.DisplayName }
+        } catch {}
+
+        if (-not $dn) { continue }
+        if ($dn -like $pattern) {
+          try {
+            Remove-Item -LiteralPath $k.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+            if (-not (Test-Path -LiteralPath $k.PSPath)) {
+              $removedCount++
+              Log ("Removed ARP uninstall registry key: " + $k.PSPath)
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+
+  return $removedCount
 }
 
 function Get-TargetValue($target, [string]$name) {
@@ -763,6 +809,13 @@ try {
       if ($did) { $removedThisRun += $tName }
     }
 
+    if ($did -and $tArpName) {
+      $arpKeysRemoved = Remove-ArpUninstallEntriesByPattern $tArpName
+      if ($arpKeysRemoved -gt 0) {
+        Log ("ARP uninstall entries removed for pattern '" + $tArpName + "': " + $arpKeysRemoved)
+      }
+    }
+
     if ($did) { $removedThisRun += $tName }
   }
   Log "Completed Pass 1"
@@ -892,6 +945,16 @@ try {
         Remove-Paths $anchorDirs
         $removedThisRun += $tName
         foreach ($d in $anchorDirs) { if (Test-Path $d) { $portableVerifiedGone = $false } }
+      }
+    }
+
+    $tArpNameResidual = Get-TargetValue $t 'ARPName'
+    if ($tArpNameResidual -and ($hits.Count -gt 0 -or $anchors.Count -gt 0 -or $deskShortcutRemoved -or ($activeUser -and $shortcutRemoved))) {
+      $arpKeysRemoved2 = Remove-ArpUninstallEntriesByPattern $tArpNameResidual
+      if ($arpKeysRemoved2 -gt 0) {
+        $tName = Get-TargetValue $t 'Name'
+        if (-not $tName) { $tName = '<unnamed-target>' }
+        Log ("Removed residual ARP uninstall entries for " + $tName + " count=" + $arpKeysRemoved2)
       }
     }
   }
