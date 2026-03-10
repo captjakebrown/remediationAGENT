@@ -1,7 +1,7 @@
 <#
 RSD CleanAgent - Intune Proactive Remediation Remediation
 PowerShell 5.1 compatible
-Version: 2026.03.09.4
+Version: 2026.03.09.5
 
 Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
 #>
@@ -20,12 +20,12 @@ $VersionFile = Join-Path $AgentRoot 'version.txt'
 $StateFile   = Join-Path $AgentRoot 'state.json'
 $LogDir      = Join-Path $AgentRoot 'Logs'
 
-$ThisVersion = '2026.03.09.4'
+$ThisVersion = '2026.03.09.5'
 
 $AgentPayload = @'
 <#
 RSD CleanAgent (local) - PowerShell 5.1
-Version: 2026.03.09.4
+Version: 2026.03.09.5
 
 Behavior:
 - Batch inventory UWP/ARP once per run.
@@ -493,6 +493,27 @@ function Get-InstallerPatternCandidates($t) {
       }
     }
   }
+  return @($stems | Where-Object { $_ -and $_.Length -ge 4 } | Select-Object -Unique | Select-Object -First 10)
+}
+
+function Get-InstallerPatternCandidates($t) {
+  # Backward-compat helper: older deployed cleanAGENT variants may invoke this
+  # during residual evaluation. Keep it present and deterministic.
+  if (-not $t) { return @() }
+  $out = New-Object System.Collections.Generic.List[string]
+  foreach ($sig in @($t.InstallerSignatures, $t.PortableExeSignatures)) {
+    if (-not $sig) { continue }
+    foreach ($v in @($sig.OriginalFilename, $sig.InstallerFileName, $sig.ProductName, $sig.CompanyName)) {
+      if (-not $v) { continue }
+      $s = $v.ToString().Trim()
+      if (-not $s) { continue }
+      if ($s -match '[\*\?]') { $out.Add($s) }
+      else {
+        $clean = ($s -replace '[\s\._-]+','*')
+        if ($clean -and $clean.Length -ge 4) { $out.Add("*" + $clean + "*") }
+      }
+    }
+  }
   return @($out | Where-Object { $_ } | Sort-Object -Unique | Select-Object -First 20)
 }
 
@@ -703,8 +724,8 @@ try {
   Log "OneDrive delete prompt policy stage complete"
 
   $targets = @(Get-Targets)
-  Log ("Target count loaded: " + $targets.Length)
-  if ($targets.Length -eq 0) {
+  Log ("Target count loaded: " + @($targets).Count)
+  if (-not $targets -or @($targets).Count -eq 0) {
     Log "targets.json missing/empty." "WARN"
     $state.lastRun = (Get-Date).ToString('o')
     Write-JsonFile $StateFile $state
@@ -718,8 +739,8 @@ try {
 
   Log "Starting ARP snapshot"
   $arpStart = Get-Date
-  $arpList = Snapshot-Arp
-  Log (("Completed ARP snapshot. Entries indexed={0} elapsedSec={1}" -f $arpList.Count, [int](New-TimeSpan -Start $arpStart -End (Get-Date)).TotalSeconds))
+  $arpList = @(Snapshot-Arp)
+  Log (("Completed ARP snapshot. Entries indexed={0} elapsedSec={1}" -f @($arpList).Count, [int](New-TimeSpan -Start $arpStart -End (Get-Date)).TotalSeconds))
 
   $foundThisRun = @()
   $removedThisRun = @()
@@ -743,7 +764,7 @@ try {
     if ($tUwpFamily) { $did = (Remove-UwpFamily $tUwpFamily) -or $did }
 
     if ($tArpName) {
-      $matches = Match-Arp $arpList $tArpName
+      $matches = @(Match-Arp $arpList $tArpName)
       foreach ($e in $matches) {
         if ($e.QuietUninstallString) {
           Log ("Quiet uninstall ARP: " + $e.DisplayName)
@@ -776,8 +797,8 @@ try {
 
   Log "Starting post-removal ARP snapshot"
   $arp2Start = Get-Date
-  $arpList2 = Snapshot-Arp
-  Log (("Completed post-removal ARP snapshot. Entries indexed={0} elapsedSec={1}" -f $arpList2.Count, [int](New-TimeSpan -Start $arp2Start -End (Get-Date)).TotalSeconds))
+  $arpList2 = @(Snapshot-Arp)
+  Log (("Completed post-removal ARP snapshot. Entries indexed={0} elapsedSec={1}" -f @($arpList2).Count, [int](New-TimeSpan -Start $arp2Start -End (Get-Date)).TotalSeconds))
 
   $residual = @()
   foreach ($t in $targets) {
@@ -808,8 +829,7 @@ try {
   $appRoots += 'C:\Program Files'
   $appRoots += 'C:\Program Files (x86)'
   $roots += (Get-ShallowCDrives)
-  $roots = $roots | Where-Object { $_ } | Select-Object -Unique
-  $appRoots = $appRoots | Where-Object { $_ } | Select-Object -Unique
+  $roots = @($roots | Where-Object { $_ } | Select-Object -Unique)
 
   Log ("Index roots: " + ($roots -join '; '))
   Log "Starting filesystem index pass"
@@ -840,24 +860,25 @@ try {
       $removedThisRun += $tName
     }
     $hits = @(Find-MatchingFiles $fileIndex $stems)
-    if ($hits.Count -gt 0) {
+    if (@($hits).Count -gt 0) {
       $foundAnyArtifacts = $true
-      $targetHitCount += $hits.Length
-      Log ("Removing artifacts for " + $tName + " hits=" + $hits.Count)
+      $tName = Get-TargetValue $t 'Name'
+      if (-not $tName) { $tName = '<unnamed-target>' }
+      Log ("Removing artifacts for " + $tName + " hits=" + @($hits).Count)
       Remove-Paths $hits
       Remove-ContainerDirectories $hits $tName $stems
       $removedThisRun += $tName
       foreach ($p in $hits) { if (Test-Path $p) { $portableVerifiedGone = $false } }
     }
 
-    $anchors = Normalize-PathAnchors (Get-TargetValue $t 'PathAnchors')
-    if ($anchors.Count -gt 0) {
-      $anchorDirs = Find-AnchorDirectories -roots $roots -anchors $anchors -maxDepth 3
-      if ($anchorDirs.Count -gt 0) {
+    $anchors = @(Normalize-PathAnchors (Get-TargetValue $t 'PathAnchors'))
+    if (@($anchors).Count -gt 0) {
+      $anchorDirs = @(Find-AnchorDirectories -roots $roots -anchors $anchors -maxDepth 3)
+      if (@($anchorDirs).Count -gt 0) {
         $foundAnyArtifacts = $true
         $tName = Get-TargetValue $t 'Name'
         if (-not $tName) { $tName = '<unnamed-target>' }
-        Log ("Removing anchor directories for " + $tName + " dirs=" + $anchorDirs.Count)
+        Log ("Removing anchor directories for " + $tName + " dirs=" + @($anchorDirs).Count)
         Remove-Paths $anchorDirs
         $removedThisRun += $tName
         foreach ($d in $anchorDirs) { if (Test-Path $d) { $portableVerifiedGone = $false } }
@@ -865,7 +886,7 @@ try {
     }
 
     $tArpNameResidual = Get-TargetValue $t 'ARPName'
-    if ($tArpNameResidual -and ($hits.Count -gt 0 -or $anchors.Count -gt 0 -or $deskShortcutRemoved -or ($activeUser -and $shortcutRemoved))) {
+    if ($tArpNameResidual -and ((@($hits).Count -gt 0) -or (@($anchors).Count -gt 0) -or $deskShortcutRemoved -or ($activeUser -and $shortcutRemoved))) {
       $arpKeysRemoved2 = Remove-ArpUninstallEntriesByPattern $tArpNameResidual
       if ($arpKeysRemoved2 -gt 0) {
         $tName = Get-TargetValue $t 'Name'
@@ -876,7 +897,7 @@ try {
   }
 
   $foundAny = @($foundThisRun | Select-Object -Unique)
-  if ($foundAny.Count -gt 0 -or $foundAnyArtifacts) {
+  if (@($foundAny).Count -gt 0 -or $foundAnyArtifacts) {
     $state = Reset-Phase $state
     $state.lastDetect = (Get-Date).ToString('o')
     $state.lastFound = $foundAny
