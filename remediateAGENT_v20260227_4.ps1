@@ -1,7 +1,7 @@
 <#
 RSD CleanAgent - Intune Proactive Remediation Remediation
 PowerShell 5.1 compatible
-Version: 2026.03.09.5
+Version: 2026.03.09.6
 
 Installs/updates local cleanAGENT + targets.json and registers a scheduled task.
 #>
@@ -20,12 +20,12 @@ $VersionFile = Join-Path $AgentRoot 'version.txt'
 $StateFile   = Join-Path $AgentRoot 'state.json'
 $LogDir      = Join-Path $AgentRoot 'Logs'
 
-$ThisVersion = '2026.03.09.5'
+$ThisVersion = '2026.03.09.6'
 
 $AgentPayload = @'
 <#
 RSD CleanAgent (local) - PowerShell 5.1
-Version: 2026.03.09.5
+Version: 2026.03.09.6
 
 Behavior:
 - Batch inventory UWP/ARP once per run.
@@ -568,6 +568,77 @@ function Remove-Paths([string[]]$paths) {
   }
 }
 
+function Remove-ContainerDirectories([string[]]$paths, [string]$targetName, [string[]]$stems) {
+  $paths = @($paths)
+  if (-not $paths -or $paths.Count -eq 0) { return 0 }
+
+  $tokens = New-Object System.Collections.Generic.List[string]
+  foreach ($s in @($stems)) {
+    if ($s) {
+      $sv = $s.ToString().Trim()
+      if ($sv.Length -ge 4) { [void]$tokens.Add($sv.ToLowerInvariant()) }
+    }
+  }
+  if ($targetName) {
+    foreach ($tok in ($targetName -split '[^A-Za-z0-9]+' | Where-Object { $_ -and $_.Length -ge 4 })) {
+      [void]$tokens.Add($tok.ToLowerInvariant())
+    }
+  }
+  $tokens = @($tokens | Sort-Object -Unique)
+
+  $candidates = New-Object System.Collections.Generic.List[string]
+  foreach ($h in $paths) {
+    if (-not $h) { continue }
+    $d = $null
+    try {
+      if (Test-Path -LiteralPath $h -PathType Container) { $d = $h }
+      else { $d = Split-Path -Path $h -Parent }
+    } catch { $d = $null }
+    if (-not $d) { continue }
+
+    # Consider parent containers up to two levels up.
+    $cur = $d
+    for ($i=0; $i -lt 3 -and $cur; $i++) {
+      if (Test-Path -LiteralPath $cur -PathType Container) {
+        $leaf = $null
+        try { $leaf = (Split-Path -Path $cur -Leaf).ToLowerInvariant() } catch { $leaf = $null }
+        $isMatch = $false
+        if ($leaf) {
+          foreach ($tk in $tokens) {
+            if ($leaf -like ('*' + $tk + '*')) { $isMatch = $true; break }
+          }
+        }
+        if ($isMatch) { [void]$candidates.Add($cur) }
+      }
+      try { $cur = Split-Path -Path $cur -Parent } catch { $cur = $null }
+    }
+  }
+
+  $uniq = @($candidates | Sort-Object -Unique)
+  if ($uniq.Count -eq 0) { return 0 }
+
+  # Keep root-most directories only.
+  $top = New-Object System.Collections.Generic.List[string]
+  foreach ($h in $uniq) {
+    $isChild = $false
+    foreach ($k in $top) {
+      if ($h.StartsWith($k + '\', [System.StringComparison]::OrdinalIgnoreCase)) { $isChild = $true; break }
+    }
+    if (-not $isChild) { [void]$top.Add($h) }
+  }
+
+  foreach ($d in $top) {
+    try {
+      if (Test-Path -LiteralPath $d -PathType Container) {
+        Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
+        Log ("Removed container directory: " + $d)
+      }
+    } catch {}
+  }
+
+  return @($top).Count
+}
+
 function Remove-QuickLaunchMatches([string]$user, [string[]]$stems) {
   $stems = @($stems)
   if (-not $user -or $stems.Length -eq 0) { return $false }
@@ -866,7 +937,10 @@ try {
       if (-not $tName) { $tName = '<unnamed-target>' }
       Log ("Removing artifacts for " + $tName + " hits=" + @($hits).Count)
       Remove-Paths $hits
-      Remove-ContainerDirectories $hits $tName $stems
+      $removedContainers = Remove-ContainerDirectories $hits $tName $stems
+      if ($removedContainers -gt 0) {
+        Log ("Removed container directories for " + $tName + " count=" + $removedContainers)
+      }
       $removedThisRun += $tName
       foreach ($p in $hits) { if (Test-Path $p) { $portableVerifiedGone = $false } }
     }
