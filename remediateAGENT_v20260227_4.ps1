@@ -536,8 +536,8 @@ try {
 
   Log "Starting ARP snapshot"
   $arpStart = Get-Date
-  $arpList = @(Snapshot-Arp)
-  Log (("Completed ARP snapshot. Entries indexed={0} elapsedSec={1}" -f @($arpList).Count, [int](New-TimeSpan -Start $arpStart -End (Get-Date)).TotalSeconds))
+  $arpList = Snapshot-Arp
+  Log (("Completed ARP snapshot. Entries indexed={0} elapsedSec={1}" -f $arpList.Count, [int](New-TimeSpan -Start $arpStart -End (Get-Date)).TotalSeconds))
 
   $foundThisRun = @()
   $removedThisRun = @()
@@ -587,8 +587,8 @@ try {
 
   Log "Starting post-removal ARP snapshot"
   $arp2Start = Get-Date
-  $arpList2 = @(Snapshot-Arp)
-  Log (("Completed post-removal ARP snapshot. Entries indexed={0} elapsedSec={1}" -f @($arpList2).Count, [int](New-TimeSpan -Start $arp2Start -End (Get-Date)).TotalSeconds))
+  $arpList2 = Snapshot-Arp
+  Log (("Completed post-removal ARP snapshot. Entries indexed={0} elapsedSec={1}" -f $arpList2.Count, [int](New-TimeSpan -Start $arp2Start -End (Get-Date)).TotalSeconds))
 
   $residual = @()
   foreach ($t in $targets) {
