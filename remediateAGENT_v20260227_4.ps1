@@ -188,21 +188,24 @@ function Ensure-ReceiptAcl([string]$p) {
   try { (Get-Item $p -ErrorAction SilentlyContinue).Attributes = 'ReadOnly' } catch {}
   try {
     icacls $p /inheritance:r | Out-Null
-    icacls $p /grant:r "Users:(RX)" "Administrators:(F)" "SYSTEM:(F)" | Out-Null
-    icacls $p /deny "Users:(W,WDAC,WO,D,DC)" | Out-Null
+    icacls $p /remove:d "Users" "Authenticated Users" | Out-Null
+    icacls $p /grant:r "Users:(R)" "Authenticated Users:(R)" "Administrators:(F)" "SYSTEM:(F)" | Out-Null
   } catch {}
 }
 
-function Update-Receipt([string[]]$removedApps) {
-  $removedApps = @($removedApps)
-  if ($removedApps.Length -eq 0) { return }
+function Update-Receipt([string[]]$incidentApps, [bool]$isNewIncident) {
+  $incidentApps = @($incidentApps | Where-Object { $_ } | Sort-Object -Unique)
+  if ($incidentApps.Length -eq 0) { return }
+
   $user = Get-ActiveUser
   $desk = Get-DesktopPathForUser $user
   if (-not $desk) { return }
+
   $receipt = Join-Path $desk 'RSD ATTN.log'
   $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-  $list = ($removedApps | Sort-Object -Unique) -join ', '
+  $list = ($incidentApps -join ', ')
   $line = "$ts - Removed: $list"
+
   if (-not (Test-Path $receipt)) {
     try {
       Set-Content -Path $receipt -Value "Forbidden software has been removed from your computer." -Encoding UTF8
@@ -210,10 +213,33 @@ function Update-Receipt([string[]]$removedApps) {
       Add-Content -Path $receipt -Value "If additional forbidden software is discovered in the future, school administration will determine appropriate discipline." -Encoding UTF8
       Add-Content -Path $receipt -Value "" -Encoding UTF8
       Add-Content -Path $receipt -Value $line -Encoding UTF8
+      Ensure-ReceiptAcl $receipt
+      return
     } catch {}
-  } else {
-    try { Add-Content -Path $receipt -Value $line -Encoding UTF8 } catch {}
   }
+
+  try {
+    if ($isNewIncident) {
+      Add-Content -Path $receipt -Value $line -Encoding UTF8
+    } else {
+      $lines = @()
+      try { $lines = @(Get-Content -Path $receipt -Encoding UTF8) } catch {}
+      $updated = $false
+      for ($i = $lines.Length - 1; $i -ge 0; $i--) {
+        if ($lines[$i] -match '^\d{4}-\d{2}-\d{2} .* - Removed: ') {
+          $lines[$i] = $line
+          $updated = $true
+          break
+        }
+      }
+      if ($updated) {
+        Set-Content -Path $receipt -Value $lines -Encoding UTF8
+      } else {
+        Add-Content -Path $receipt -Value $line -Encoding UTF8
+      }
+    }
+  } catch {}
+
   Ensure-ReceiptAcl $receipt
 }
 
@@ -480,7 +506,7 @@ try {
     if (-not $mutexOwned) { return }
   } catch {}
 
-  $state = Read-JsonFile $StateFile @{ phase=0; phaseStart=(Get-Date).ToString('o'); lastDetect=(Get-Date).ToString('o'); lastRun=(Get-Date).ToString('o'); lastFound=@() }
+  $state = Read-JsonFile $StateFile @{ phase=0; phaseStart=(Get-Date).ToString('o'); lastDetect=(Get-Date).ToString('o'); lastRun=(Get-Date).ToString('o'); lastFound=@(); incidentOpen=$false; incidentApps=@(); lastExitCode=0; lastSweepSucceeded=$true }
   $state = Advance-PhaseIfTime $state
 
   if (-not (Is-DueToRun $state)) {
@@ -630,22 +656,42 @@ try {
   }
 
   $foundAny = @($foundThisRun | Select-Object -Unique)
-  if ($foundAny.Length -gt 0 -or $foundAnyArtifacts) {
+  $runFoundForbidden = ($foundAny.Length -gt 0 -or $foundAnyArtifacts)
+
+  if ($runFoundForbidden) {
     $state = Reset-Phase $state
     $state.lastDetect = (Get-Date).ToString('o')
     $state.lastFound = $foundAny
-    Update-Receipt ($removedThisRun | Select-Object -Unique)
+
+    $incidentAppsThisRun = @($foundThisRun + $removedThisRun | Select-Object -Unique)
+    $isNewIncident = (-not [bool]$state.incidentOpen)
+    if ($isNewIncident) {
+      $state.incidentApps = @($incidentAppsThisRun)
+    } else {
+      $state.incidentApps = @($state.incidentApps + $incidentAppsThisRun | Select-Object -Unique)
+    }
+    $state.incidentOpen = $true
+
+    Update-Receipt $state.incidentApps $isNewIncident
   } else {
     $state = Advance-PhaseIfTime $state
+    $state.lastFound = @()
   }
-
-  $state.lastRun = (Get-Date).ToString('o')
-  Write-JsonFile $StateFile $state
 
   if (-not $portableVerifiedGone) {
     Log -m "Portable verification failed (some artifacts remain)." -lvl "WARN"
     $scriptExitCode = 1
   }
+
+  if ($scriptExitCode -eq 0 -and -not $runFoundForbidden) {
+    $state.incidentOpen = $false
+    $state.incidentApps = @()
+  }
+
+  $state.lastRun = (Get-Date).ToString('o')
+  $state.lastExitCode = $scriptExitCode
+  $state.lastSweepSucceeded = ($scriptExitCode -eq 0)
+  Write-JsonFile $StateFile $state
 }
 catch {
   $scriptExitCode = 1
@@ -2176,7 +2222,7 @@ Write-FileUtf8 $TargetsPath $TargetsPayload
 Write-FileUtf8 $VersionFile $ThisVersion
 
 if (-not (Test-Path $StateFile)) {
-   $initObj = @{ phase=0; phaseStart=(Get-Date).ToString("o"); lastDetect=(Get-Date).ToString("o"); lastRun=(Get-Date).ToString("o"); lastFound=@() }
+   $initObj = @{ phase=0; phaseStart=(Get-Date).ToString("o"); lastDetect=(Get-Date).ToString("o"); lastRun=(Get-Date).ToString("o"); lastFound=@(); incidentOpen=$false; incidentApps=@(); lastExitCode=0; lastSweepSucceeded=$true }
   $init = ($initObj | ConvertTo-Json -Depth 6)
   Write-FileUtf8 $StateFile $init
 }
